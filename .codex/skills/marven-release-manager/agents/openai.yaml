@@ -1,0 +1,5 @@
+interface:
+  display_name: "Marven Release Manager"
+  short_description: "Prepare and govern Marven release batches"
+  brand_color: "#8BE9FD"
+  default_prompt: "Use $marven-release-manager to prepare the next Marven release batch and report each platform’s go/no-go status without publishing."
