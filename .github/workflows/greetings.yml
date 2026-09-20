@@ -1,0 +1,56 @@
+name: Greet first-time contributors
+
+on:
+  issues:
+    types: [opened]
+  # This event lets the workflow welcome contributors from forks. The job must
+  # never check out or execute code from the pull request.
+  pull_request_target:
+    types: [opened]
+
+permissions:
+  issues: write
+  pull-requests: write
+
+jobs:
+  greeting:
+    name: Welcome first-time contributors
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+
+    steps:
+      - name: Post the Marven welcome message
+        # Pinned to the current actions/first-interaction v3 commit.
+        uses: actions/first-interaction@1c4688942c71f71d4f5502a26ea67c331730fa4d
+        with:
+          issue_message: |
+            👋 Welcome to Marven, and thank you for opening your first issue!
+
+            Marven is Heshware's local-first Personal Sovereign AI research project. To help us investigate, please include:
+
+            - the expected and actual behavior;
+            - clear reproduction steps;
+            - your operating system and relevant Python or Node.js version;
+            - the model backend involved, such as Ollama or vLLM; and
+            - sanitized logs or screenshots when useful.
+
+            If the issue affects memory, privacy, permissions, voice, files, web access, or local/cloud processing, please call that out explicitly.
+
+            **Do not post credentials, private conversations, memory archives, personal data, private local paths, model weights, or signing material.** Review the [project architecture](https://github.com/ahesh001/Marven/blob/main/README.md) and [privacy guidance](https://github.com/ahesh001/Marven/blob/main/PRIVACY.md) before sharing diagnostic material.
+
+            A maintainer will review the issue as soon as possible. Thanks for helping improve Marven.
+
+          pr_message: |
+            🚀 Welcome to Marven, and thank you for your first contribution!
+
+            Before review, please make sure the pull request:
+
+            - explains what changed and why;
+            - lists the tests and builds you ran;
+            - distinguishes implemented behavior from experiments or roadmap work;
+            - describes any memory migration, privacy, permission, security, or data-disclosure impact; and
+            - excludes credentials, private memory, personal data, model weights, signing material, and generated local artifacts.
+
+            Please keep the implementation consistent with Marven's [architecture and responsible-claims boundaries](https://github.com/ahesh001/Marven/blob/main/README.md) and [privacy guidance](https://github.com/ahesh001/Marven/blob/main/PRIVACY.md).
+
+            Release-oriented changes will go through the Marven Release Manager's platform-specific gates before publication. A maintainer will review your pull request soon—thank you for building with us.
