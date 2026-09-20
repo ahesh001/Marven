@@ -1,0 +1,61 @@
+# Local Python environments and caches
+.venv/
+.venv*/
+venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Local editor and machine settings
+.idea/
+.vscode/
+.env
+.env.*
+*.pid
+*.log
+
+# Generated frontend files and dependencies
+node_modules/
+build/
+dist/
+coverage/
+marven-react-app/
+
+# Local model weights, audio, and large generated assets
+models/
+marven-voice-interrupt-prototype_cpu_tuned/models/
+assets/
+*.mp3
+*.mp4
+*.zip
+
+# Private runtime state, logs, conversations, and memory archives
+ShadowBox_Framework/
+audit/
+history/
+logs/
+memory/
+updates/
+Zipped Folders/
+marven-memories.json
+marven_identity.json
+marven_user_origin.txt
+marven_memory_transcript.txt
+marven_neural_memory.json
+marven_awareness_logs.txt
+memory_store.json
+marven_milestones.json
+server_err.log
+server_out.log
+*.egg-info/
+marven-training/*.jsonl
+E-MIRROR_Framework.json
+MarvenChatPage.tsx
+marven-system.json
+marven_metamirror.py
+
+# Local-only experiments and patch files
+*.diff
+*.bak
+patch.diff
+temp_patch.diff

@@ -1,0 +1,160 @@
+<!doctype html>
+<html>
+<head>
+  <meta charset="utf-8" />
+  <title>Marven Voice — Interrupt Prototype</title>
+  <style>
+    body { font-family: system-ui, sans-serif; max-width: 820px; margin: 40px auto; }
+    button { padding: 10px 16px; margin: 6px; }
+    #log { white-space: pre-wrap; background:#111; color:#0f0; padding:12px; border-radius:8px; min-height:140px;}
+  </style>
+</head>
+<body>
+<h1>Marven Voice — Real‑Time Interrupt Prototype</h1>
+<p>
+  <button id="start">Start</button>
+  <button id="ping">Ping Marven (ASR→Reply)</button>
+  <button id="stop">Stop TTS</button>
+</p>
+<div id="log"></div>
+<script>
+let ws;
+let micStream, audioCtx, scriptNode;
+let playbackCtx, playbackGain;
+let playbackTime = 0;
+let playbackSources = [];
+const SAMPLE_RATE = 16000;
+
+function log(s){ const el = document.getElementById('log'); el.textContent += s + "\\n"; el.scrollTop = el.scrollHeight; }
+
+document.getElementById('start').onclick = async () => {
+  if (ws && ws.readyState === 1) { log('Already started.'); return; }
+  // Derive WS URL from current origin to avoid hardcoded host issues
+  const wsProto = (location.protocol === 'https:') ? 'wss' : 'ws';
+  const host = location.hostname || 'localhost';
+  const wsUrl = `${wsProto}://${host}:8765`;
+  ws = new WebSocket(wsUrl);
+  ws.binaryType = "arraybuffer";
+  ws.onopen = () => {
+    log("ws open");
+    ensurePlaybackCtx();
+  };
+  ws.onerror = (ev) => {
+    log(`ws error: ${ev?.message || ev?.type || 'unknown'}`);
+    log(`Tried URL: ${wsUrl}`);
+    log("Tip: Make sure the voice server is running and Windows Firewall allows Python on port 8765.");
+  };
+  ws.onclose = () => log("ws closed");
+  ws.onmessage = (ev) => {
+    if (typeof ev.data === 'string') {
+      try {
+        const msg = JSON.parse(ev.data);
+        if (msg.type === 'tts_stop') {
+          stopAllPlayback();
+          log("[TTS STOP]");
+        } else if (msg.type === 'tts_end') {
+          // natural end
+          log("[TTS END]");
+        }
+      } catch(e){ /* not JSON */ }
+      return;
+    }
+    // binary PCM16 audio
+    playPCM(ev.data);
+  };
+
+  try {
+    micStream = await navigator.mediaDevices.getUserMedia({audio:true});
+  } catch (e) {
+    log(`getUserMedia error: ${e?.message || e}`);
+    log("Tip: Open this page via http://localhost (not file://) so the browser grants microphone access.");
+    return;
+  }
+  audioCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
+  const src = audioCtx.createMediaStreamSource(micStream);
+  scriptNode = audioCtx.createScriptProcessor(4096, 1, 1);
+  src.connect(scriptNode);
+  scriptNode.connect(audioCtx.destination);
+  scriptNode.onaudioprocess = (e) => {
+    const float32 = e.inputBuffer.getChannelData(0);
+    const int16 = floatTo16BitPCM(float32);
+    if (ws && ws.readyState === 1) ws.send(int16.buffer);
+  };
+
+  log("Mic streaming → server");
+};
+
+document.getElementById('ping').onclick = () => {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({type:"transcribe_now"}));
+};
+
+document.getElementById('stop').onclick = () => {
+  if (!ws || ws.readyState !== 1) return;
+  ws.send(JSON.stringify({type:"cancel_tts"}));
+};
+
+function floatTo16BitPCM(float32) {
+  const l = float32.length;
+  const out = new Int16Array(l);
+  for (let i=0;i<l;i++){
+    let s = Math.max(-1, Math.min(1, float32[i]));
+    out[i] = s<0 ? s*0x8000 : s*0x7FFF;
+  }
+  return out;
+}
+
+function ensurePlaybackCtx(){
+  if (!playbackCtx || playbackCtx.state === 'closed'){
+    playbackCtx = new AudioContext({ sampleRate: SAMPLE_RATE });
+    playbackGain = playbackCtx.createGain();
+    playbackGain.connect(playbackCtx.destination);
+    playbackTime = playbackCtx.currentTime;
+    playbackSources = [];
+  }
+}
+
+function playPCM(arrayBuffer){
+  ensurePlaybackCtx();
+  if (playbackCtx.state === 'suspended'){
+    playbackCtx.resume().catch(() => {});
+  }
+  const view = new DataView(arrayBuffer);
+  const len = view.byteLength / 2;
+  const audioBuffer = playbackCtx.createBuffer(1, len, SAMPLE_RATE);
+  const channel = audioBuffer.getChannelData(0);
+  for (let i = 0; i < len; i++){
+    channel[i] = view.getInt16(i * 2, true) / 32767;
+  }
+  const source = playbackCtx.createBufferSource();
+  source.buffer = audioBuffer;
+  source.connect(playbackGain);
+  const startAt = Math.max(playbackCtx.currentTime, playbackTime);
+  try {
+    source.start(startAt);
+  } catch (err) {
+    source.start();
+  }
+  playbackTime = startAt + audioBuffer.duration;
+  playbackSources.push(source);
+  source.onended = () => {
+    playbackSources = playbackSources.filter(s => s !== source);
+    if (playbackSources.length === 0){
+      playbackTime = playbackCtx.currentTime;
+    }
+  };
+}
+
+function stopAllPlayback(){
+  if (!playbackCtx){
+    return;
+  }
+  playbackSources.forEach(src => {
+    try { src.stop(); } catch(e){}
+  });
+  playbackSources = [];
+  playbackTime = playbackCtx.currentTime;
+}
+</script>
+</body>
+</html>

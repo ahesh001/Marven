@@ -1,0 +1,1 @@
+This file represents a placeholder for future full model weights or embedding snapshots.

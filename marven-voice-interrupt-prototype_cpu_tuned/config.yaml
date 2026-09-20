@@ -1,0 +1,42 @@
+# CPU-friendly defaults for Lenovo Yoga (Intel i7, ~12 GB RAM, no dGPU)
+asr_backend: vosk   # options: vosk | faster_whisper | whispercpp
+sample_rate: 16000
+vad_mode: 2          # try 3 in very noisy rooms
+
+marven:
+  enabled: true
+  session_id: "voice"
+  model: null
+  prompt_prefix: ""
+
+vosk:
+  model_path: "models/vosk-model-small-en-us-0.15"  # small model for CPU
+
+# Optional alternative: Faster-Whisper on CPU with int8 for speed (slightly lower accuracy)
+faster_whisper:
+  model_size: "small"       # try "tiny" for even lower latency
+  device: "cpu"             # force CPU
+  compute_type: "int8"      # best perf/quality tradeoff on CPU
+
+whispercpp:
+  server_url: "http://127.0.0.1:8080/transcribe"  # adjust for your setup
+
+tts:
+  provider: espeak
+  voice: en-us
+  rate_wpm: 175
+  pitch: 50
+  volume: 100
+  # If your espeak-ng install uses a different path, set espeak_path here
+  espeak_path: "C:/Program Files/eSpeak NG/espeak-ng.exe"
+  # smaller chunks -> faster stop on interrupt; raise if choppy
+  chunk_ms: 120
+
+  # Nemotron / NeMo VoiceChat settings (use provider: nemotron)
+  # provider: nemotron
+  # nemo_dir: "C:/path/to/Speech"
+  # checkpoint_dir: "C:/path/to/nemotron_checkpoint"
+  # device: "cuda"
+  # python_executable: "C:/Marven/.venv311/Scripts/python.exe"
+  # output chunk size sent to the browser
+  # chunk_ms: 160

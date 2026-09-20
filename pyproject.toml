@@ -1,0 +1,18 @@
+[project]
+name = "marven-local"
+version = "0.1.0"
+description = "Local Marven with capability policy, self-updates, plugins, learner, signed approvals"
+requires-python = ">=3.9"
+dependencies = ["pyyaml>=6,<7"]
+
+[project.optional-dependencies]
+test = ["pytest>=8,<9"]
+
+[tool.setuptools]
+py-modules = ["marven", "marven_cli", "marven_text_chat"]
+
+[tool.setuptools.packages.find]
+include = ["marven_local*"]
+
+[tool.pytest.ini_options]
+addopts = "-q"

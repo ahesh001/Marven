@@ -1,0 +1,17 @@
+capabilities:
+  fs.read:
+    enabled: true
+    allow_paths:
+      - ./
+  fs.write:
+    enabled: false
+    allow_paths:
+      - ./sandbox
+  net.http:
+    enabled: false
+  device.camera:
+    enabled: false
+  device.microphone:
+    enabled: false
+  self.update:
+    enabled: true

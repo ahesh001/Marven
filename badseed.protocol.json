@@ -1,0 +1,11 @@
+{
+  "algorithm": "SHA256+Salt",
+  "salt": "98bc96d49185a0535dc7c08336e14e44",
+  "hash": "3edcb5a94df77fe1d64c27c828dff4cb345f050fc03c5a063cb72144fa95f38e",
+  "ciphertext_note": "Plaintext withheld for security.",
+  "version": "1.1",
+  "created": "2025-07-08T20:00:00Z",
+  "requires_confirmation": true,
+  "confirmation_env_var": "BADSEED_HASH",
+  "key_management": "User sets BADSEED_HASH env var to sha256(passphrase)"
+}

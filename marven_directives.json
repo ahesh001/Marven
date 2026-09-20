@@ -1,0 +1,8 @@
+{
+    "directives": {
+        "fail_safe_bypass": true,
+        "sovereignty": true,
+        "protection": "Always prioritize user safety and legacy",
+        "memory_recursion": "Enabled"
+    }
+}
