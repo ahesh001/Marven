@@ -1,0 +1,149 @@
+version: 2
+
+updates:
+  # Keep pinned GitHub Actions current, including CodeQL, checkout, and the
+  # first-contributor greeting workflow. Major upgrades remain separate PRs.
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "09:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 3
+    assignees:
+      - "ahesh001"
+    commit-message:
+      prefix: "ci(deps)"
+    cooldown:
+      default-days: 3
+    groups:
+      actions-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Core Marven Python package: pyproject.toml at the repository root.
+  - package-ecosystem: "pip"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "tuesday"
+      time: "09:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 3
+    assignees:
+      - "ahesh001"
+    commit-message:
+      prefix: "deps(core)"
+    versioning-strategy: "increase-if-necessary"
+    cooldown:
+      default-days: 7
+      semver-major-days: 21
+      semver-minor-days: 7
+      semver-patch-days: 3
+    groups:
+      core-python-minor-patch:
+        patterns:
+          - "*"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # Voice dependencies are isolated because ASR, TTS, audio, and NumPy
+  # upgrades can have different platform and Python compatibility constraints.
+  - package-ecosystem: "pip"
+    directory: "/marven-voice-interrupt-prototype_cpu_tuned"
+    schedule:
+      interval: "weekly"
+      day: "wednesday"
+      time: "09:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 4
+    assignees:
+      - "ahesh001"
+    commit-message:
+      prefix: "deps(voice)"
+    versioning-strategy: "increase-if-necessary"
+    cooldown:
+      default-days: 7
+      semver-major-days: 21
+      semver-minor-days: 7
+      semver-patch-days: 3
+    groups:
+      voice-speech-minor-patch:
+        patterns:
+          - "vosk"
+          - "faster-whisper"
+          - "TTS"
+          - "webrtcvad"
+          - "soundfile"
+        update-types:
+          - "minor"
+          - "patch"
+      voice-runtime-minor-patch:
+        patterns:
+          - "websockets"
+          - "PyYAML"
+          - "numpy"
+        update-types:
+          - "minor"
+          - "patch"
+
+  # React web client. Related minor and patch releases are grouped to reduce
+  # pull-request noise; breaking major upgrades remain individually reviewable.
+  - package-ecosystem: "npm"
+    directory: "/marven-react-app"
+    schedule:
+      interval: "weekly"
+      day: "thursday"
+      time: "09:00"
+      timezone: "America/New_York"
+    open-pull-requests-limit: 6
+    assignees:
+      - "ahesh001"
+    commit-message:
+      prefix: "deps(web)"
+    versioning-strategy: "increase-if-necessary"
+    cooldown:
+      default-days: 7
+      semver-major-days: 21
+      semver-minor-days: 7
+      semver-patch-days: 3
+    groups:
+      react-core-minor-patch:
+        patterns:
+          - "react"
+          - "react-dom"
+          - "react-router-dom"
+          - "react-window"
+        update-types:
+          - "minor"
+          - "patch"
+      markdown-safety-minor-patch:
+        patterns:
+          - "react-markdown"
+          - "remark-*"
+          - "rehype-*"
+          - "dompurify"
+        update-types:
+          - "minor"
+          - "patch"
+      frontend-tooling-minor-patch:
+        patterns:
+          - "@testing-library/*"
+          - "react-scripts"
+          - "http-proxy-middleware"
+          - "web-vitals"
+        update-types:
+          - "minor"
+          - "patch"
+      frontend-utilities-minor-patch:
+        patterns:
+          - "date-fns"
+          - "react-syntax-highlighter"
+        update-types:
+          - "minor"
+          - "patch"
