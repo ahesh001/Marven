@@ -861,7 +861,12 @@ def marven_response(user_input: str, session_id: str = "akeem", model: Optional[
 
     # Log user episode
     try:
-        memmgr.log_episode("user", user_input, {"session": session_id})
+        memmgr.log_episode(
+            "user",
+            user_input,
+            {"session": session_id},
+            session_id=session_id,
+        )
     except Exception:
         pass
 
@@ -925,8 +930,20 @@ def marven_response(user_input: str, session_id: str = "akeem", model: Optional[
         if not val:
             return "Usage: remember: <fact, preference, or note>"
         try:
-            mid = memmgr.add_memory(val, tags=["user-note", "episodic"]) 
-            memmgr.log_episode("system", f"remember added: {mid}", {"session": session_id})
+            mid = memmgr.add_memory(
+                val,
+                tags=["user-note", "episodic"],
+                session_id=session_id,
+                episode_id=session_id,
+                source="user",
+                source_locator=f"{session_id}:remember",
+            )
+            memmgr.log_episode(
+                "system",
+                f"remember added: {mid}",
+                {"session": session_id},
+                session_id=session_id,
+            )
             return f"Stored memory ({mid})."
         except Exception:
             return "Memory operation failed."
@@ -941,7 +958,14 @@ def marven_response(user_input: str, session_id: str = "akeem", model: Optional[
             data.append({"id": f"mm_{uuid.uuid4().hex[:10]}", "text": val, "tags": ["MetaMirror", "meta"], "ts": datetime.datetime.utcnow().isoformat() + "Z"})
             _MM_STORE.write_text(json.dumps(data, indent=2), encoding="utf-8")
             try:
-                memmgr.add_memory(val, tags=["MetaMirror", "meta"])  # index into main DB for retrieval
+                memmgr.add_memory(
+                    val,
+                    tags=["MetaMirror", "meta"],
+                    session_id=session_id,
+                    episode_id=session_id,
+                    source="user",
+                    source_locator=f"{session_id}:metamirror",
+                )  # index into main DB for retrieval
             except Exception:
                 pass
             return "Stored in MetaMirror memory."
@@ -1129,7 +1153,12 @@ def marven_response(user_input: str, session_id: str = "akeem", model: Optional[
     cached = memmgr.get_cached(cache_key, ttl_sec=CACHE_TTL)
     if cached:
         try:
-            memmgr.log_episode("assistant", cached, {"session": session_id, "cached": True})
+            memmgr.log_episode(
+                "assistant",
+                cached,
+                {"session": session_id, "cached": True},
+                session_id=session_id,
+            )
         except Exception:
             pass
         return cached
@@ -1203,11 +1232,23 @@ def marven_response(user_input: str, session_id: str = "akeem", model: Optional[
             auto_tags.append("project")
         if any(k in l for k in ["name", "you prefer", "preference"]):
             auto_tags.append("user-pref")
-        memmgr.add_memory(text=f"Summary: {summary}\nWhy: {why}", tags=(auto_tags or ["identity"]))
+        memmgr.add_memory(
+            text=f"Summary: {summary}\nWhy: {why}",
+            tags=(auto_tags or ["identity"]),
+            session_id=session_id,
+            episode_id=session_id,
+            source="assistant",
+            source_locator=f"{session_id}:response-summary",
+        )
     except Exception:
         pass
     try:
-        memmgr.log_episode("assistant", out, {"session": session_id})
+        memmgr.log_episode(
+            "assistant",
+            out,
+            {"session": session_id},
+            session_id=session_id,
+        )
     except Exception:
         pass
     return out

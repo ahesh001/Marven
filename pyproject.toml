@@ -7,6 +7,7 @@ dependencies = ["pyyaml>=6,<7"]
 
 [project.optional-dependencies]
 test = ["pytest>=8,<9"]
+memory = ["sentence-transformers>=3"]
 
 [tool.setuptools]
 py-modules = ["marven", "marven_cli", "marven_text_chat"]

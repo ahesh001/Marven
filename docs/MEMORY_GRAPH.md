@@ -9,14 +9,18 @@ This is intentionally a graph-first implementation, not a graph neural network. 
 ```mermaid
 flowchart TD
     A["Approved memory write"] --> B["Canonical mem record"]
-    B --> C["Hash-vector projection"]
-    B --> D["Typed evidence graph"]
-    E["User query"] --> F["Semantic seed retrieval"]
-    C --> F
-    F --> G["Bounded graph expansion"]
-    D --> G
-    G --> H["Validity, trust, consent, visibility gates"]
-    H --> I["Ranked evidence with graph path"]
+    B --> C["Pluggable embedding projection"]
+    B --> D["SQLite FTS5 projection"]
+    B --> E["Typed evidence graph"]
+    F["Scoped user query"] --> G["Validity, trust, consent, visibility gates"]
+    B --> G
+    G --> H["Embedding and lexical candidates"]
+    C --> H
+    D --> H
+    H --> I["Reciprocal-rank fusion"]
+    I --> J["Bounded graph expansion"]
+    E --> J
+    J --> K["Ranked evidence with graph path"]
 ```
 
 The graph can propose related evidence. It cannot create, edit, confirm, supersede, or delete canonical memory.
@@ -28,6 +32,8 @@ The existing `mem` table is migrated in place. Legacy rows are preserved and rec
 | Field | Purpose |
 | --- | --- |
 | `id` | Stable canonical memory ID |
+| `workspace_id` / `owner_id` | Required logical identity boundary for every read and write |
+| `agent_id` / `session_id` | Optional agent and conversation narrowing inside an owner boundary |
 | `text` | Original approved memory value |
 | `tags` | User- or system-approved index labels |
 | `ts` | Creation timestamp |
@@ -61,20 +67,21 @@ The projection contains memory nodes plus stable concept nodes. It deliberately 
 | `lineage` | Memory | `derived_from` | `source_for` |
 | `supersedes` | Memory | `supersedes` | `superseded_by` |
 
-Concept-node IDs are stable hashes of normalized values. Each edge includes the canonical ID and field that produced it, so retrieval paths remain explainable.
+Concept-node IDs are stable hashes of normalized values salted by workspace and owner. Identical entity or tag names therefore cannot join two owners' graph projections. Each edge includes the canonical ID and field that produced it, so retrieval paths remain explainable.
 
 ## Retrieval
 
 `MemoryManager.search_evidence()` performs:
 
-1. Eligibility filtering against deletion, supersession, validity, trust, consent, and visibility.
-2. Semantic scoring over a merged index key containing the original value plus approved subject, tags, facts, keyphrases, timestamped events, and aliases.
-3. Selection of semantic seed memories.
-4. At most two graph hops by default, with explicit edge allowlists and neighbor limits.
-5. A bounded graph contribution to the original score.
-6. Return of the canonical record, component scores, and best graph path.
+1. Hard filtering by workspace and owner, with optional agent and session narrowing.
+2. Eligibility filtering against deletion, supersession, validity, trust, consent, and visibility.
+3. Embedding and SQLite FTS5 candidate generation over the original value plus approved subject, tags, facts, keyphrases, timestamped events, and aliases.
+4. Candidate union and reciprocal-rank fusion so lexical-only evidence is not discarded by the embedding stage.
+5. At most two graph hops by default, with explicit edge allowlists and neighbor limits.
+6. A bounded graph contribution to the fused score.
+7. Return of the canonical record, component scores, provider identity, and best graph path.
 
-The compatibility method `search()` returns the original tuple shape, while Marven's response path now enables graph expansion by default.
+The compatibility method `search()` returns the original tuple shape, while Marven's response path now enables hybrid retrieval and graph expansion by default. See [Scoped Hybrid Memory Retrieval](HYBRID_MEMORY_RETRIEVAL.md).
 
 ## LongMemEval lessons applied
 
@@ -104,10 +111,12 @@ The adapter does not download data or call an external model. It compares flat a
 
 ## Local API
 
-- `GET /api/memory/top?q=...&graph=true&hops=2` returns ranked evidence and graph paths.
+- `GET /api/memory/top?q=...&workspace_id=...&owner_id=...&graph=true&hops=2` returns scoped hybrid evidence and graph paths.
 - `GET /api/memory/top?...&as_of=...&time_start=...&time_end=...` applies temporal scope.
-- `GET /api/memory/graph?memory_id=...&hops=2&limit=200` returns a bounded projection for inspection or a future Brain Tour view.
+- `GET /api/memory/graph?memory_id=...&workspace_id=...&owner_id=...&hops=2&limit=200` returns a bounded owner projection for inspection or a future Brain Tour view.
 - `POST /api/memory/graph/rebuild` regenerates the graph from canonical records.
+- `POST /api/memory/proposals` creates a scoped candidate that cannot affect retrieval until approved.
+- `POST /api/memory/proposals/<id>/approve` or `/reject` records the admission decision.
 
 ## When to add a GNN
 

@@ -54,14 +54,14 @@ The first canonical schema is now implemented in SQLite. Records carry a stable 
 
 Marven is moving toward a two-stage retrieval design:
 
-- **Candidate generation:** fast dense and lexical search over approved memories. The current prototype uses a lightweight SQLite memory store; FAISS or pgvector are candidate production backends.
+- **Candidate generation:** scoped embedding and SQLite FTS5 search over approved memories, with candidate union and reciprocal-rank fusion before graph expansion. The dependency-free hash embedder remains a fallback; a learned local sentence-transformer can be enabled without changing canonical records.
 - **Optional late-interaction reranking:** token-level representations and MaxSim-style comparison can recover precise details that a single-vector search may miss. ColBERT-style reranking is an active research direction, not a production dependency in this repository.
 
 Reranking improves relevance. It does **not** prove that a memory is true, decide which belief is current, resolve contradictions, enforce consent, or propagate deletion. Those remain governance responsibilities after retrieval.
 
 ### Evidence graph and Brain Tour
 
-The implemented evidence graph is an interpretable SQLite projection over canonical memory records. It connects subjects, tags, episodes, entities, sources, lineage, and supersession relationships while keeping traversal typed, bounded, and auditable. Retrieval returns its score components and best graph path. The graph may propose related evidence; it cannot silently rewrite canonical memory.
+The implemented evidence graph is an interpretable SQLite projection over canonical memory records. It connects subjects, tags, episodes, entities, sources, lineage, and supersession relationships while keeping traversal typed, bounded, owner-scoped, and auditable. Retrieval returns embedding, lexical, fusion, and graph score components plus the best graph path. The graph may propose related evidence; it cannot silently rewrite canonical memory.
 
 The Brain Tour can use the bounded graph API as a visualization and navigation layer over approved memory IDs and episode groups. The projection is regenerable from the canonical store rather than becoming a second, competing memory database. A graph neural network is not assumed; deterministic traversal must prove useful first. See [Canonical Memory and Evidence Graph](docs/MEMORY_GRAPH.md).
 
@@ -73,7 +73,7 @@ The Brain Tour can use the bounded graph API as a visualization and navigation l
 | Local API | Flask endpoints for chat, streaming, health, file analysis, vision experiments, memory inspection, and local capabilities | Working prototype; interfaces may change |
 | Web client | React chat UI with model selection, file, policy, proposal, and Brain Tour controls | Working prototype |
 | Model backends | Ollama through LangChain plus an OpenAI-compatible local vLLM adapter | Experimental local inference |
-| Memory | Canonical SQLite records, rebuildable vector and evidence-graph projections, governed graph-aware retrieval, MetaMirror/reflection experiments, and local archives | Working prototype; admission and evaluation remain experimental |
+| Memory | Owner-scoped canonical SQLite records, approval-gated proposals, rebuildable embedding/FTS5/evidence-graph projections, hybrid RRF retrieval, MetaMirror/reflection experiments, and local archives | Working prototype; extraction and evaluation remain experimental |
 | Capability controls | Policy-checked file/network/device capabilities, audit records, and signed self-update proposals | Experimental; not a complete sandbox |
 | Voice | Optional Vosk or Faster-Whisper ASR with interruptible local TTS | Separate prototype |
 | Personalization | Ollama model helpers and a LoRA training script | Research tooling |
@@ -88,6 +88,7 @@ Legacy prompts, manifests, and experimental directives in the repository do not 
 - `marven_local/memory/` — canonical memory schema, migration, projection rebuilding, graph traversal, temporal gates, and explainable retrieval.
 - `scripts/evaluate_longmemeval_retrieval.py` — local flat-versus-graph retrieval evaluation on LongMemEval data.
 - `docs/MEMORY_GRAPH.md` — memory schema, graph model, API, benchmark mapping, and GNN adoption gate.
+- `docs/HYBRID_MEMORY_RETRIEVAL.md` — scope boundaries, embedding/FTS5 fusion, proposal admission, and score semantics.
 - `marven_local/` — capability policy, audit logging, plugins, learner experiments, and approval-based self-update workflow.
 - `marven-react-app/` — local React chat interface.
 - `marven-voice-interrupt-prototype_cpu_tuned/` — optional local ASR/TTS voice prototype.
@@ -120,6 +121,12 @@ python -m pip install langchain-ollama langchain langchain-community langchain-c
 ```
 
 The package metadata currently covers the local capability package and tests. The second install command adds the runtime libraries used by the text and Flask prototypes.
+
+For learned local memory embeddings, install the optional memory dependencies:
+
+```powershell
+python -m pip install -e ".[memory,test]"
+```
 
 Start or download a local Ollama model:
 
@@ -160,6 +167,11 @@ For complete Windows commands, use [RUN_WINDOWS.md](RUN_WINDOWS.md). The voice p
 | `MARVEN_DEFAULT_MODEL` | Default Ollama model | `marven` |
 | `MARVEN_CODE_MODEL` | Ollama model selected for `code:` prompts | `llama3:8b` |
 | `MARVEN_CACHE_TTL` | Local response-cache lifetime in seconds | `30` |
+| `MARVEN_WORKSPACE_ID` | Default logical memory workspace | `local` |
+| `MARVEN_OWNER_ID` | Default canonical-memory owner | `primary` |
+| `MARVEN_AGENT_ID` | Default agent identity written with memory | `marven` |
+| `MARVEN_MEMORY_EMBEDDER` | Memory embedding provider: `hash` or `sentence-transformers` | `hash` |
+| `MARVEN_MEMORY_EMBEDDING_MODEL` | Local sentence-transformer model when enabled | `intfloat/e5-small-v2` |
 | `VLLM_BASE_URL` | OpenAI-compatible local vLLM API | `http://127.0.0.1:8001/v1` |
 | `VLLM_MODELS` | Comma-separated model IDs routed to vLLM | Empty |
 | `REACT_APP_API_BASE` | React client's Marven API URL | `http://127.0.0.1:8000` |
@@ -188,7 +200,7 @@ The present code is an experimental prototype. Review it before enabling file ac
 
 - Harden the memory-admission workflow so provenance, consent, sensitivity, and trust decisions are explicit before storage.
 - Evaluate flat and graph-expanded retrieval on LongMemEval and Marven-specific update, temporal, privacy, and abstention cases.
-- Add hybrid lexical/dense retrieval and optional late-interaction reranking against realistic queries and hard negatives.
+- Evaluate the implemented embedding/FTS5/graph fusion against realistic queries and hard negatives, then add optional late-interaction reranking only if it improves the baseline.
 - Build the Brain Tour visualization from the bounded graph API and canonical IDs.
 - Consider a GNN only after deterministic baselines and labeled data show which node, edge, or path predictions are useful.
 - Add evaluation for retrieval quality, contradiction handling, stale-memory rejection, privacy leakage, and abstention.
