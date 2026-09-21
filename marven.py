@@ -13,17 +13,25 @@ from typing import Optional, List, Tuple
 from urllib import request as _urlreq, parse as _urlparse
 import re as _re
 
+from marven_local.security import (
+    SecurityValidationError,
+    extract_readable_text as _extract_readable_text,
+    open_public_http_url,
+    resolve_path_within,
+    validate_identifier,
+)
+
 from langchain_ollama import OllamaLLM
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
 from langchain_core.runnables.history import RunnableWithMessageHistory
 from langchain_community.chat_message_histories import FileChatMessageHistory
 
-# Ensure history directory exists
-default_history_dir = Path("history/akeem")
-default_history_dir.mkdir(parents=True, exist_ok=True)
-
 # Load configuration files (robust to UTFâ€‘8 BOM)
-base = Path(__file__).parent
+base = Path(__file__).resolve().parent
+
+# Ensure history directory exists
+default_history_dir = base / "history" / "akeem"
+default_history_dir.mkdir(parents=True, exist_ok=True)
 
 def _load_json_no_bom(p: Path, default):
     try:
@@ -218,7 +226,9 @@ prompt = ChatPromptTemplate.from_messages(
 )
 
 def get_history(session_id: str):
-    return FileChatMessageHistory(default_history_dir / f"{session_id}.json")
+    safe_session_id = validate_identifier(session_id, field="session ID")
+    history_path = resolve_path_within(default_history_dir, f"{safe_session_id}.json")
+    return FileChatMessageHistory(history_path)
 
 # -----------------------------
 # Web helpers
@@ -280,8 +290,12 @@ def with_timeout(fn, seconds: float = 8.0, fallback=None):
 
 def _fetch_url(url: str, method: str = "GET", max_bytes: int = 1_500_000, timeout: int = 20) -> str:
     try:
-        req = _urlreq.Request(url, method=method, headers={"User-Agent": "Marven/1.0 (+https://localhost)"})
-        with _urlreq.urlopen(req, timeout=timeout) as r:
+        with open_public_http_url(
+            url,
+            method=method,
+            headers={"User-Agent": "Marven/1.0 (+https://localhost)"},
+            timeout=timeout,
+        ) as r:
             ctype = r.headers.get("Content-Type", "")
             charset = "utf-8"
             if "charset=" in ctype:
@@ -304,8 +318,10 @@ def _fetch_url(url: str, method: str = "GET", max_bytes: int = 1_500_000, timeou
                     text += "\n...[truncated]..."
                 return text
             return f"Fetched binary content ({ctype or 'unknown type'}), {len(raw)} bytes{' (truncated)' if truncated else ''}."
-    except Exception as e:
-        return f"Web fetch error: {e}"
+    except SecurityValidationError:
+        return "Web fetch blocked by the network security policy."
+    except Exception:
+        return "Web fetch failed."
 
 def _parse_web_command(user_input: str):
     s = (user_input or "").strip()
@@ -330,32 +346,21 @@ def handle_web_command(user_input: str):
         return True, "Invalid URL. Use http(s)://..."
     if kind == "head":
         try:
-            req = _urlreq.Request(url, method="HEAD", headers={"User-Agent": "Marven/1.0 (+https://localhost)"})
-            with _urlreq.urlopen(req, timeout=15) as r:
+            with open_public_http_url(
+                url,
+                method="HEAD",
+                headers={"User-Agent": "Marven/1.0 (+https://localhost)"},
+                timeout=15,
+            ) as r:
                 headers = {k: v for k, v in r.headers.items()}
-                return True, json.dumps({"url": url, "status": r.status, "headers": headers}, indent=2)
-        except Exception as e:
-            return True, f"Web HEAD error: {e}"
+                return True, json.dumps({"url": r.url, "status": r.status, "headers": headers}, indent=2)
+        except SecurityValidationError:
+            return True, "Web request blocked by the network security policy."
+        except Exception:
+            return True, "Web HEAD request failed."
     return True, _fetch_url(url, method="GET")
 
-import re as _re
 from html import unescape as _html_unescape
-
-def _extract_readable_text(html: str, max_chars: int = 100_000) -> str:
-    if not isinstance(html, str) or not html:
-        return ""
-    s = _re.sub(r"<script\b[^<]*(?:(?!</script>)<[^<]*)*</script>", " ", html, flags=_re.IGNORECASE | _re.DOTALL)
-    s = _re.sub(r"<style\b[^<]*(?:(?!</style>)<[^<]*)*</style>", " ", s, flags=_re.IGNORECASE | _re.DOTALL)
-    s = _re.sub(r"<!--.*?-->", " ", s, flags=_re.DOTALL)
-    m_title = _re.search(r"<title[^>]*>(.*?)</title>", s, flags=_re.IGNORECASE | _re.DOTALL)
-    title = m_title.group(1).strip() if m_title else ""
-    s = _re.sub(r"<[^>]+>", " ", s)
-    s = _html_unescape(s)
-    s = _re.sub(r"\s+", " ", s).strip()
-    text = (f"Title: {title}\n\n" + s) if title else s
-    if len(text) > max_chars:
-        text = text[:max_chars] + "\n...[truncated]..."
-    return text
 
 def _build_web_analysis_prompt(url: str, page_text: str) -> str:
     header = (
@@ -390,21 +395,10 @@ def _parse_web_search(user_input: str):
         if q.startswith("<") and q.endswith(">"):
             q = q[1:-1].strip()
         return q or None
-    # Natural-language patterns
-    m = _re.match(r"^(?:search(?:\s+up|\s+for)?\s+|look\s*up\s+|lookup\s+|google\s+|bing\s+|ddg\s+)(.+)$", lower)
-    if m:
-        # Keep original casing from s using span of match on s
-        # Recompute with length difference between prefixes
-        # Simple approach: slice from the end of the prefix length in original string
-        prefix_len = len(s) - len(s.lstrip())  # leading spaces not part of query
-        # Use matched group on original string by offsetting based on lower-case match
-        # Fallback: extract tail of original by removing the same number of tokens
-        try:
-            start = s.lower().index(m.group(1))
-            q = s[start:].strip()
-        except Exception:
-            q = s[len(s) - len(m.group(1)) :].strip()
-        return q or None
+    # Fixed prefixes avoid backtracking on untrusted input.
+    for prefix in ("search up ", "search for ", "search ", "look up ", "lookup ", "google ", "bing ", "ddg "):
+        if lower.startswith(prefix):
+            return s[len(prefix):].strip() or None
     return None
 
 def _web_search(query: str, limit: int = 5):
@@ -443,8 +437,8 @@ def _web_search(query: str, limit: int = 5):
             if len(items) >= limit:
                 break
         return items
-    except Exception as e:
-        return {"error": f"Search error: {e}"}
+    except Exception:
+        return {"error": "Search request failed."}
 
 def _format_search_results(results):
     if isinstance(results, dict) and results.get("error"):
@@ -781,8 +775,8 @@ def log_web_analysis_codex(url: str, page_text: str, analysis_text: str, http_me
         except Exception:
             pass
         return {"path": str(path), "yaml": yaml_text}
-    except Exception as e:
-        return {"error": str(e)}
+    except Exception:
+        return {"error": "Unable to save the web analysis."}
 
 # -----------------------------
 # Main response
@@ -1015,7 +1009,10 @@ def self_aware_reflect(user_input: str, output: str, session_id: str | None = No
 
 def marven_response(user_input: str, session_id: str = "akeem", model: Optional[str] = None, self_aware: bool = False) -> str:
     lower = user_input.strip().lower()
-    hist_path = default_history_dir / f"{session_id}.json"
+    try:
+        session_id = validate_identifier(session_id, field="session ID")
+    except SecurityValidationError:
+        return "Invalid session ID."
 
     # Log user episode
     try:
@@ -1025,10 +1022,7 @@ def marven_response(user_input: str, session_id: str = "akeem", model: Optional[
 
     # Local file helpers
     def _safe(rel: str) -> Path:
-        p = (base / rel).resolve()
-        if not str(p).startswith(str(base.resolve())):
-            raise ValueError("Path outside allowed directory")
-        return p
+        return resolve_path_within(base, rel)
 
     if lower.startswith("readfile:"):
         rel = user_input[len("readfile:"):].strip()
@@ -1037,8 +1031,10 @@ def marven_response(user_input: str, session_id: str = "akeem", model: Optional[
             if not p.exists() or not p.is_file():
                 return "Not found"
             return p.read_text(encoding="utf-8", errors="replace")
-        except Exception as e:
-            return f"Read error: {e}"
+        except SecurityValidationError:
+            return "Read blocked: path is outside the project directory."
+        except Exception:
+            return "Read failed."
 
     if lower.startswith("writefile:"):
         rest = user_input[len("writefile:"):].lstrip()
@@ -1052,8 +1048,10 @@ def marven_response(user_input: str, session_id: str = "akeem", model: Optional[
             p.parent.mkdir(parents=True, exist_ok=True)
             p.write_text(content, encoding="utf-8")
             return f"Wrote {len(content.encode('utf-8'))} bytes to {rel}"
-        except Exception as e:
-            return f"Write error: {e}"
+        except SecurityValidationError:
+            return "Write blocked: path is outside the project directory."
+        except Exception:
+            return "Write failed."
 
     # DOCX writer
     if lower.startswith("write:docx"):
@@ -1071,8 +1069,10 @@ def marven_response(user_input: str, session_id: str = "akeem", model: Optional[
             data = _create_docx_bytes(content)
             p.write_bytes(data)
             return f"Wrote DOCX ({len(data)} bytes) to {rel}"
-        except Exception as e:
-            return f"DOCX write error: {e}"
+        except SecurityValidationError:
+            return "DOCX write blocked: path is outside the project directory."
+        except Exception:
+            return "DOCX write failed."
 
     # Command: remember (persistent episodic memory)
     if lower.startswith("remember:"):
@@ -1083,8 +1083,8 @@ def marven_response(user_input: str, session_id: str = "akeem", model: Optional[
             mid = memmgr.add_memory(val, tags=["user-note", "episodic"]) 
             memmgr.log_episode("system", f"remember added: {mid}", {"session": session_id})
             return f"Stored memory ({mid})."
-        except Exception as e:
-            return f"Memory error: {e}"
+        except Exception:
+            return "Memory operation failed."
 
     # Command: remember_mm (MetaMirror store)
     if lower.startswith("remember_mm:") or lower.startswith("remember-mm:"):
@@ -1100,8 +1100,8 @@ def marven_response(user_input: str, session_id: str = "akeem", model: Optional[
             except Exception:
                 pass
             return "Stored in MetaMirror memory."
-        except Exception as e:
-            return f"MetaMirror memory error: {e}"
+        except Exception:
+            return "MetaMirror memory operation failed."
 
     # Web commands
     handled, web_out = handle_web_command(user_input)
@@ -1178,8 +1178,8 @@ def marven_response(user_input: str, session_id: str = "akeem", model: Optional[
             synthesis = _postprocess_reply(raw_reply, history_msgs)
             header = "\n".join(link_lines)
             return f"{header}\n\n{synthesis}"
-        except Exception as e:
-            return f"Research attempt failed: {e}"
+        except Exception:
+            return "Research attempt failed."
 
     # Web compare
     urls = _parse_web_compare(user_input)
@@ -1514,4 +1514,4 @@ def backfill_metamirror_reflections() -> dict:
         return {"imported": imported, "skipped": skipped}
     except Exception as e:
         print(f"[Backfill] Error: {e}")
-        return {"error": str(e)}
+        return {"error": "Backfill failed."}

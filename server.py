@@ -1,5 +1,4 @@
 import json
-import re
 import subprocess
 import time
 import uuid
@@ -10,12 +9,22 @@ from flask import Response, stream_with_context
 from flask_cors import CORS
 import csv
 from urllib import request as _urlreq
+from marven_local.security import (
+    SecurityValidationError,
+    extract_fenced_updates as _extract_fenced_updates,
+    resolve_path_within,
+    validate_identifier,
+)
 try:
     import marven_local as marven_local
 except Exception:
     marven_local = None
 import marven
 from marven import marven_response  # make sure marven.py is in the same folder
+
+
+BASE_DIR = Path(__file__).resolve().parent
+HISTORY_DIR = BASE_DIR / "history" / "akeem"
 
 # ---- vLLM (local Marven model) integration ----
 # Configure via env vars; talks directly to vLLM's OpenAI-compatible HTTP endpoints without SDKs.
@@ -86,8 +95,9 @@ def _vllm_complete_sync(user_input: str, session_id: str, model: str, self_aware
         data = json.loads(body)
         text = ((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""
         return True, text.strip()
-    except Exception as e:
-        return False, f"vLLM request failed: {e}"
+    except Exception:
+        _report_exception("vLLM request failed")
+        return False, "Model request failed."
 
 def _vllm_complete_stream(user_input: str, session_id: str, model: str, message_id: str, self_aware: bool = False):
     """Stream chunks from vLLM via raw HTTP SSE (data: lines)."""
@@ -143,8 +153,9 @@ def _vllm_complete_stream(user_input: str, session_id: str, model: str, message_
                                 yield {"type": "text", "data": delta, "id": message_id}
                     except Exception:
                         continue
-    except Exception as e:
-        yield {"type": "text", "data": f"vLLM stream failed: {e}", "id": message_id}
+    except Exception:
+        _report_exception("vLLM stream failed")
+        yield {"type": "error", "error": "Model stream failed.", "id": message_id}
         yield {"type": "done", "id": message_id}
 
 
@@ -152,6 +163,27 @@ def _vllm_complete_stream(user_input: str, session_id: str, model: str, message_
 
 app = Flask(__name__)
 CORS(app)
+
+
+def _report_exception(context: str) -> str:
+    """Log server-side details and return an opaque correlation ID."""
+    error_id = uuid.uuid4().hex[:12]
+    app.logger.exception("%s [error_id=%s]", context, error_id)
+    return error_id
+
+
+def _json_failure(message: str, status: int, context: str):
+    error_id = _report_exception(context)
+    return jsonify({"error": message, "errorId": error_id}), status
+
+
+def _safe_session_id(value: object) -> str:
+    return validate_identifier(value, field="session ID")
+
+
+def _history_path(value: object) -> Path:
+    session_id = _safe_session_id(value)
+    return resolve_path_within(HISTORY_DIR, f"{session_id}.json")
 
 @app.route("/health", methods=["GET"])
 def api_health():
@@ -651,8 +683,11 @@ def respond_stream():
                         with open(p, 'wb') as f:
                             f.write(data_bytes)
                         yield _ev({"type": "text", "data": f"Wrote DOCX ({len(data_bytes)} bytes) to {rel}"})
-                    except Exception as e:
-                        yield _ev({"type": "text", "data": f"DOCX write error: {e}"})
+                    except SecurityValidationError:
+                        yield _ev({"type": "error", "error": "DOCX path is outside the project directory."})
+                    except Exception:
+                        _report_exception("DOCX write failed")
+                        yield _ev({"type": "error", "error": "DOCX write failed."})
                     yield _ev({"type": "done"})
                     return
             except Exception:
@@ -855,8 +890,9 @@ def respond_stream():
                             files.append(info)
                         if files:
                             yield _ev({"type": "applied", "files": files})
-                    except Exception as e:
-                        yield _ev({"type": "applied_error", "error": str(e)})
+                    except Exception:
+                        _report_exception("Automatic file update failed")
+                        yield _ev({"type": "applied_error", "error": "Automatic file update failed."})
                 return
             # Handle web:compare <url1> <url2> ... by fetching all and streaming a comparative analysis
             try:
@@ -974,10 +1010,12 @@ def respond_stream():
                         files.append(info)
                     if files:
                         yield _ev({"type": "applied", "files": files})
-                except Exception as e:
-                    yield _ev({"type": "applied_error", "error": str(e)})
-        except Exception as e:
-            yield _ev({"type": "error", "error": str(e)})
+                except Exception:
+                    _report_exception("Automatic file update failed")
+                    yield _ev({"type": "applied_error", "error": "Automatic file update failed."})
+        except Exception:
+            _report_exception("Response stream failed")
+            yield _ev({"type": "error", "error": "Response stream failed."})
 
     return Response(stream_with_context(generate()), mimetype="text/plain")
 
@@ -999,13 +1037,17 @@ def chat():
 @app.get("/api/history")
 def history():
     """Return recent messages (limit param optional)."""
-    limit = int(request.args.get("limit", 20))
-    session_id = request.args.get("sessionId", "akeem")
-    path = Path("history") / "akeem" / f"{session_id}.json"
-    if not path.exists():
-        return jsonify([])
-    with open(path, encoding="utf-8") as f:
-        entries = json.load(f)[-limit:]
+    try:
+        limit = max(1, min(int(request.args.get("limit", 20)), 200))
+        path = _history_path(request.args.get("sessionId", "akeem"))
+        if not path.exists():
+            return jsonify([])
+        with path.open(encoding="utf-8") as history_file:
+            entries = json.load(history_file)[-limit:]
+    except (SecurityValidationError, ValueError):
+        return jsonify({"error": "Invalid history request."}), 400
+    except Exception:
+        return _json_failure("Unable to load history.", 500, "History read failed")
     flat = [
         {
             "content": e.get("data", {}).get("content", ""),
@@ -1017,12 +1059,16 @@ def history():
 
 @app.get("/api/memories")
 def memories():
-    session_id = request.args.get("sessionId", "akeem")
-    path = Path("history") / "akeem" / f"{session_id}.json"
-    if not path.exists():
-        return jsonify([])
-    with open(path, encoding="utf-8") as f:
-        return jsonify(json.load(f))
+    try:
+        path = _history_path(request.args.get("sessionId", "akeem"))
+        if not path.exists():
+            return jsonify([])
+        with path.open(encoding="utf-8") as history_file:
+            return jsonify(json.load(history_file))
+    except SecurityValidationError:
+        return jsonify({"error": "Invalid session ID."}), 400
+    except Exception:
+        return _json_failure("Unable to load memories.", 500, "Memory history read failed")
 
 @app.get("/api/brain/meta")
 def brain_meta():
@@ -1054,8 +1100,8 @@ def brain_tour():
 def api_tasks():
     try:
         return jsonify(TASKS)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        return _json_failure("Unable to load tasks.", 500, "Task listing failed")
 
 # --- Additional APIs: Vision + Filesystem ---
 
@@ -1074,8 +1120,9 @@ def ensure_ollama_model(model: str):
         if pull.returncode == 0:
             return True, pull.stdout[-4000:]
         return False, pull.stderr or pull.stdout
-    except Exception as e:
-        return False, str(e)
+    except Exception:
+        _report_exception("Ollama model check failed")
+        return False, "Model backend unavailable."
 
 
 def _offline_fallback_reply(user_input: str, model_name: str, detail: str) -> str:
@@ -1094,8 +1141,7 @@ def _offline_fallback_reply(user_input: str, model_name: str, detail: str) -> st
         "- `write:docx path.docx` writes a docx from content\n"
     )
     hint = (f"Input: {ui}\n" if ui else "")
-    note = f"Details: {detail}" if detail else ""
-    return "\n".join([header, tips, hint, note]).strip()
+    return "\n".join([header, tips, hint]).strip()
 
 
 @app.post("/api/ollama/pull")
@@ -1105,7 +1151,7 @@ def api_ollama_pull():
     ok, msg = ensure_ollama_model(model)
     if ok:
         return jsonify({"status": "ok", "model": model, "message": msg})
-    return jsonify({"status": "error", "model": model, "error": msg}), 500
+    return jsonify({"status": "error", "model": model, "error": "Model pull failed."}), 500
 
 
 @app.post("/api/vision")
@@ -1130,35 +1176,12 @@ def vision_describe():
         text = getattr(resp, "content", None) or str(resp)
         _ = marven.marven_response(f"Image analysis requested: {prompt}", session_id=session_id)
         return jsonify({"output": text})
-    except Exception as e:
-        return jsonify({"error": f"Vision model not available: {e}"}), 400
-
-
-BASE_DIR = Path(__file__).resolve().parent
+    except Exception:
+        return _json_failure("Vision model is unavailable.", 503, "Vision request failed")
 
 
 def _safe_path(rel_path: str) -> Path:
-    p = (BASE_DIR / rel_path).resolve()
-    if not str(p).startswith(str(BASE_DIR)):
-        raise ValueError("Path outside allowed directory")
-    return p
-
-
-def _extract_fenced_updates(text: str):
-    """Yield (path, content) for code fences like:
-    ```file: relative/path.ext
-    ...content...
-    ```
-    or
-    ```path=relative/path.ext
-    ...
-    ```
-    """
-    pattern = re.compile(r"```[^\n`]*?(?:file|path)\s*[:=]\s*([^\s`]+)\s*\n([\s\S]*?)\n```", re.MULTILINE)
-    for m in pattern.finditer(text):
-        rel = m.group(1).strip()
-        content = m.group(2)
-        yield rel, content
+    return resolve_path_within(BASE_DIR, rel_path)
 
 
 def _write_file_safe(rel: str, content: str):
@@ -1178,8 +1201,10 @@ def fs_read():
         if not p.exists() or not p.is_file():
             return jsonify({"error": "Not found"}), 404
         return jsonify({"path": rel, "content": p.read_text(encoding="utf-8", errors="replace")})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+    except SecurityValidationError:
+        return jsonify({"error": "Path is outside the project directory."}), 400
+    except Exception:
+        return _json_failure("Unable to read file.", 500, "Filesystem read failed")
 
 
 @app.post("/api/fs/write")
@@ -1194,8 +1219,10 @@ def fs_write():
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
         return jsonify({"status": "ok", "path": rel, "bytes": len(content.encode("utf-8"))})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+    except SecurityValidationError:
+        return jsonify({"error": "Path is outside the project directory."}), 400
+    except Exception:
+        return _json_failure("Unable to write file.", 500, "Filesystem write failed")
 
 
 @app.get("/api/fs/list")
@@ -1218,8 +1245,10 @@ def fs_list():
                 "path": str(child.relative_to(BASE_DIR))
             })
         return jsonify({"path": str(p.relative_to(BASE_DIR)), "entries": entries})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 400
+    except SecurityValidationError:
+        return jsonify({"error": "Path is outside the project directory."}), 400
+    except Exception:
+        return _json_failure("Unable to list directory.", 500, "Filesystem listing failed")
 
 
 @app.post("/api/vision_stream")
@@ -1262,8 +1291,9 @@ def vision_stream():
                 if text.startswith(acc) and len(text) >= len(acc):
                     acc = text
             yield _ev({"type": "done"})
-        except Exception as e:
-            yield _ev({"type": "error", "error": str(e)})
+        except Exception:
+            _report_exception("Vision stream failed")
+            yield _ev({"type": "error", "error": "Vision stream failed."})
 
     return Response(stream_with_context(generate()), mimetype="text/plain")
 
@@ -1278,6 +1308,12 @@ def _local_caps_and_updater():
     return caps.policy, caps, updater
 
 
+def _proposal_path(name: object) -> Path:
+    if not isinstance(name, str) or not name.endswith(".patch") or Path(name).name != name:
+        raise SecurityValidationError("Invalid proposal name")
+    return resolve_path_within(marven_local.PROPOSALS_DIR, name)  # type: ignore[union-attr]
+
+
 @app.get("/api/local/capabilities")
 def local_capabilities():
     try:
@@ -1285,8 +1321,8 @@ def local_capabilities():
             return jsonify({})
         policy, _, _ = _local_caps_and_updater()
         return jsonify(policy.data)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        return _json_failure("Unable to load capabilities.", 500, "Capability listing failed")
 
 
 @app.route("/api/local/fs/list", methods=["GET", "POST"])
@@ -1298,10 +1334,10 @@ def local_fs_list():
         else:
             path = (request.get_json() or {}).get("path", ".")
         return jsonify({"path": path, "entries": caps.fs_list(path)})
-    except marven_local.CapabilityError as e:  # type: ignore[attr-defined]
-        return jsonify({"error": str(e)}), 403
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except marven_local.CapabilityError:  # type: ignore[attr-defined]
+        return jsonify({"error": "Operation not permitted."}), 403
+    except Exception:
+        return _json_failure("Unable to list directory.", 500, "Local filesystem listing failed")
 
 
 @app.route("/api/local/fs/read", methods=["GET", "POST"])
@@ -1315,10 +1351,10 @@ def local_fs_read():
         if not path:
             return jsonify({"error": "Missing path", "usage": "/api/local/fs/read?path=relative/or/absolute/path"}), 400
         return jsonify({"path": path, "content": caps.fs_read(path)})
-    except marven_local.CapabilityError as e:  # type: ignore[attr-defined]
-        return jsonify({"error": str(e)}), 403
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except marven_local.CapabilityError:  # type: ignore[attr-defined]
+        return jsonify({"error": "Operation not permitted."}), 403
+    except Exception:
+        return _json_failure("Unable to read file.", 500, "Local filesystem read failed")
 
 
 @app.route("/api/local/fs/write", methods=["GET", "POST"])
@@ -1336,10 +1372,10 @@ def local_fs_write():
             return jsonify({"error": "Missing path"}), 400
         out = caps.fs_write(path, content)
         return jsonify({"status": "ok", "path": out, "bytes": len(content.encode("utf-8"))})
-    except marven_local.CapabilityError as e:  # type: ignore[attr-defined]
-        return jsonify({"error": str(e)}), 403
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except marven_local.CapabilityError:  # type: ignore[attr-defined]
+        return jsonify({"error": "Operation not permitted."}), 403
+    except Exception:
+        return _json_failure("Unable to write file.", 500, "Local filesystem write failed")
 
 
 @app.post("/api/local/self_update/propose")
@@ -1353,13 +1389,14 @@ def local_self_update_propose():
         description = data.get("description") or "Marven proposed update"
         if not target or search is None or replace is None:
             return jsonify({"error": "Missing target/search/replace"}), 400
-        path = updater.propose_edit_in_file(Path(target), search, replace, description)
+        safe_target = resolve_path_within(BASE_DIR, target)
+        path = updater.propose_edit_in_file(safe_target, search, replace, description)
         approval = Path(str(path)).with_suffix(".APPROVE.json")
         return jsonify({"proposal": str(path), "approval": str(approval)})
-    except marven_local.CapabilityError as e:  # type: ignore[attr-defined]
-        return jsonify({"error": str(e)}), 403
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except (marven_local.CapabilityError, SecurityValidationError):  # type: ignore[attr-defined]
+        return jsonify({"error": "Operation not permitted."}), 403
+    except Exception:
+        return _json_failure("Unable to create update proposal.", 500, "Update proposal failed")
 
 
 @app.post("/api/local/self_update/apply")
@@ -1368,10 +1405,10 @@ def local_self_update_apply():
         _, caps, updater = _local_caps_and_updater()
         changed = updater.apply_approved()
         return jsonify({"applied": bool(changed)})
-    except marven_local.CapabilityError as e:  # type: ignore[attr-defined]
-        return jsonify({"error": str(e)}), 403
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except marven_local.CapabilityError:  # type: ignore[attr-defined]
+        return jsonify({"error": "Operation not permitted."}), 403
+    except Exception:
+        return _json_failure("Unable to apply updates.", 500, "Update application failed")
 
 
 @app.get("/api/local/self_update/proposals")
@@ -1410,8 +1447,8 @@ def local_self_update_proposals():
                 "manifest": manifest_json,
             })
         return jsonify(items)
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        return _json_failure("Unable to list proposals.", 500, "Proposal listing failed")
 
 
 @app.get("/api/local/self_update/proposal")
@@ -1422,8 +1459,8 @@ def local_self_update_proposal():
         name = request.args.get("name")
         if not name:
             return jsonify({"error": "Missing name"}), 400
-        patch = (marven_local.PROPOSALS_DIR / name) if marven_local else None
-        if patch is None or not patch.exists():
+        patch = _proposal_path(name)
+        if not patch.exists():
             return jsonify({"error": "Not found"}), 404
         raw = patch.read_text(encoding="utf-8", errors="replace")
         approval = patch.with_suffix(".APPROVE.json")
@@ -1434,8 +1471,10 @@ def local_self_update_proposal():
             except Exception:
                 appr = None
         return jsonify({"patch": name, "content": raw, "approval": approval.name, "approval_content": appr})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except SecurityValidationError:
+        return jsonify({"error": "Invalid proposal name."}), 400
+    except Exception:
+        return _json_failure("Unable to load proposal.", 500, "Proposal read failed")
 
 
 @app.post("/api/local/self_update/approve")
@@ -1448,8 +1487,8 @@ def local_self_update_approve():
         approved = bool(data.get("approved", True))
         if not name:
             return jsonify({"error": "Missing proposal"}), 400
-        patch = (marven_local.PROPOSALS_DIR / name) if marven_local else None
-        if patch is None or not patch.exists():
+        patch = _proposal_path(name)
+        if not patch.exists():
             return jsonify({"error": "Proposal not found"}), 404
         approval = patch.with_suffix(".APPROVE.json")
         if not approval.exists():
@@ -1458,8 +1497,10 @@ def local_self_update_approve():
         j["approved"] = approved
         approval.write_text(json.dumps(j, indent=2), encoding="utf-8")
         return jsonify({"status": "ok", "approval": approval.name, "approved": approved})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except SecurityValidationError:
+        return jsonify({"error": "Invalid proposal name."}), 400
+    except Exception:
+        return _json_failure("Unable to approve proposal.", 500, "Proposal approval failed")
 
 
 @app.post("/api/analyze_files")
@@ -1569,8 +1610,9 @@ def analyze_files_stream():
                 if text.startswith(acc) and len(text) >= len(acc):
                     acc = text
             yield _ev({"type": "done"})
-        except Exception as e:
-            yield _ev({"type": "error", "error": str(e)})
+        except Exception:
+            _report_exception("File analysis stream failed")
+            yield _ev({"type": "error", "error": "File analysis stream failed."})
 
     return Response(stream_with_context(generate()), mimetype="text/plain")
 
@@ -1598,11 +1640,8 @@ def local_policy():
             content = data.get("content", "")
             Path(path).write_text(content, encoding="utf-8")
             return jsonify({"status": "ok", "bytes": len(content.encode("utf-8"))})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-if __name__ == "__main__":
-    app.run(port=8000, debug=True)
+    except Exception:
+        return _json_failure("Unable to update policy.", 500, "Policy operation failed")
 # ---- Memory inspection endpoints ----
 @app.get("/api/memory/top")
 def api_memory_top():
@@ -1613,8 +1652,8 @@ def api_memory_top():
         rows = marven.memmgr.search(q, top_k=max(1, min(k, 20)), boost_tags=boost)
         out = [{"id": mid, "text": text, "tags": tags, "score": float(score)} for (mid, text, tags, score) in rows]
         return jsonify({"query": q, "top": out})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        return _json_failure("Unable to search memory.", 500, "Memory search failed")
 
 
 @app.get("/api/memory/hot")
@@ -1622,8 +1661,8 @@ def api_memory_hot():
     try:
         items = marven.memmgr.list_hot(50)
         return jsonify({"hot": items})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        return _json_failure("Unable to load memory.", 500, "Hot memory listing failed")
 
 
 @app.post("/api/memory/compress")
@@ -1631,8 +1670,8 @@ def api_memory_compress():
     try:
         res = marven.memmgr.compress_old()
         return jsonify({"status": "ok", "result": res})
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+    except Exception:
+        return _json_failure("Unable to compress memory.", 500, "Memory compression failed")
 
 
 # ---- Optional embedding endpoint (uses sentence-transformers if available) ----
@@ -1650,8 +1689,11 @@ def api_embed():
             model = SentenceTransformer(model_name)
             vec = model.encode([text], normalize_embeddings=True)[0]
             return jsonify({"embedding": vec.tolist(), "dim": int(len(vec))})
-        except Exception as e:
-            return jsonify({"error": f"Embedding backend unavailable: {e}"}), 500
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
+        except Exception:
+            return _json_failure("Embedding backend is unavailable.", 503, "Embedding request failed")
+    except Exception:
+        return _json_failure("Unable to create embedding.", 500, "Embedding endpoint failed")
 
+
+if __name__ == "__main__":
+    app.run(port=8000, debug=False)
