@@ -4,10 +4,6 @@ import time
 import uuid
 import random
 import datetime
-import sqlite3
-import hashlib
-import math
-import struct
 from pathlib import Path
 from typing import Optional, List, Tuple
 from urllib import request as _urlreq, parse as _urlparse
@@ -20,6 +16,7 @@ from marven_local.security import (
     resolve_path_within,
     validate_identifier,
 )
+from marven_local.memory import MemoryManager as CanonicalMemoryManager
 
 from langchain_ollama import OllamaLLM
 from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
@@ -478,163 +475,11 @@ def _build_web_compare_prompt(url_texts: List[Tuple[str, str]]) -> str:
     return "\n".join(parts)
 
 # -----------------------------
-# Persistent Memory v1 (SQLite)
+# Canonical Memory + Evidence Graph
 # -----------------------------
-class MemoryManager:
-    def __init__(self, root: Path):
-        self.root = root
-        self.mem_dir = self.root / "memory"
-        self.mem_dir.mkdir(parents=True, exist_ok=True)
-        self.db_path = self.mem_dir / "marven_mem.db"
-        self.cache_path = self.mem_dir / "prompt_cache.json"
-        self.dim = 256
-        self._conn = sqlite3.connect(str(self.db_path))
-        self._conn.execute("PRAGMA journal_mode=WAL;")
-        self._conn.execute("PRAGMA synchronous=NORMAL;")
-        self._ensure_schema()
-        try:
-            self._cache = json.loads(self.cache_path.read_text(encoding="utf-8"))
-        except Exception:
-            self._cache = {}
-
-    def _ensure_schema(self):
-        c = self._conn.cursor()
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS mem (
-          id TEXT PRIMARY KEY,
-          text TEXT NOT NULL,
-          tags TEXT DEFAULT '',
-          ts TEXT NOT NULL,
-          score REAL DEFAULT 0
-        );
-        """)
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS emb (
-          id TEXT PRIMARY KEY,
-          vector BLOB NOT NULL,
-          dim INTEGER NOT NULL
-        );
-        """)
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS episodes (
-          id INTEGER PRIMARY KEY AUTOINCREMENT,
-          ts TEXT NOT NULL,
-          role TEXT NOT NULL,
-          content TEXT NOT NULL,
-          meta TEXT
-        );
-        """)
-        c.execute("""
-        CREATE TABLE IF NOT EXISTS hot (
-          id TEXT PRIMARY KEY,
-          ts TEXT NOT NULL,
-          hits INTEGER DEFAULT 0
-        );
-        """)
-        c.execute("CREATE INDEX IF NOT EXISTS idx_mem_ts ON mem(ts);")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_mem_tags ON mem(tags);")
-        c.execute("CREATE INDEX IF NOT EXISTS idx_ep_ts ON episodes(ts);")
-        self._conn.commit()
-
-    def _embed(self, text: str) -> bytes:
-        vec = [0.0] * self.dim
-        if not text:
-            return struct.pack(f"{self.dim}f", *vec)
-        for tok in text.lower().split():
-            h = int(hashlib.sha1(tok.encode("utf-8")).hexdigest(), 16)
-            idx = h % self.dim
-            sign = -1.0 if ((h >> 8) & 1) else 1.0
-            vec[idx] += sign
-        norm = math.sqrt(sum(v * v for v in vec)) or 1.0
-        vec = [v / norm for v in vec]
-        return struct.pack(f"{self.dim}f", *vec)
-
-    def _unpack(self, blob: bytes) -> List[float]:
-        return list(struct.unpack(f"{self.dim}f", blob))
-
-    def log_episode(self, role: str, content: str, meta: Optional[dict] = None):
-        ts = datetime.datetime.utcnow().isoformat() + "Z"
-        self._conn.execute("INSERT INTO episodes(ts, role, content, meta) VALUES (?,?,?,?)", (ts, role, content or "", json.dumps(meta or {})))
-        self._conn.commit()
-
-    def add_memory(self, text: str, tags: Optional[List[str]] = None, ts: Optional[str] = None, score: float = 0.0) -> str:
-        if not text:
-            raise ValueError("empty memory text")
-        mid = f"mem_{uuid.uuid4().hex[:12]}"
-        ts = ts or (datetime.datetime.utcnow().isoformat() + "Z")
-        tag_str = ",".join(tags or [])
-        self._conn.execute("INSERT INTO mem(id, text, tags, ts, score) VALUES (?,?,?,?,?)", (mid, text, tag_str, ts, score))
-        vec = self._embed(text)
-        self._conn.execute("INSERT INTO emb(id, vector, dim) VALUES (?,?,?)", (mid, sqlite3.Binary(vec), self.dim))
-        self._conn.commit()
-        return mid
-
-    def search(self, query: str, top_k: int = 5, boost_tags: Optional[List[str]] = None) -> List[Tuple[str, str, List[str], float]]:
-        qv = self._unpack(self._embed(query))
-        rows = self._conn.execute("SELECT mem.id, mem.text, mem.tags, emb.vector FROM mem JOIN emb ON mem.id = emb.id").fetchall()
-        scored: List[Tuple[str, str, List[str], float]] = []
-        boost_set = set((boost_tags or []))
-        for mid, text, tags, vblob in rows:
-            vv = self._unpack(vblob)
-            dot = sum(a * b for a, b in zip(qv, vv))
-            tb = 0.0
-            if tags:
-                for t in tags.split(","):
-                    if t.strip() in boost_set:
-                        tb += 0.15
-            scored.append((mid, text, tags.split(",") if tags else [], dot + tb))
-        scored.sort(key=lambda x: x[3], reverse=True)
-        return scored[: top_k]
-
-    def record_hit(self, mem_id: str):
-        now = datetime.datetime.utcnow().isoformat() + "Z"
-        cur = self._conn.cursor()
-        cur.execute("INSERT INTO hot(id, ts, hits) VALUES (?,?,1) ON CONFLICT(id) DO UPDATE SET hits = hits + 1, ts = excluded.ts", (mem_id, now))
-        self._conn.commit()
-        self._trim_hot(50)
-
-    def _trim_hot(self, max_items: int):
-        cur = self._conn.cursor()
-        rows = cur.execute("SELECT id FROM hot ORDER BY hits DESC, ts DESC").fetchall()
-        if len(rows) <= max_items:
-            return
-        to_remove = rows[max_items:]
-        for (mid,) in to_remove:
-            cur.execute("DELETE FROM hot WHERE id = ?", (mid,))
-        self._conn.commit()
-
-    def list_hot(self, limit: int = 50) -> List[dict]:
-        cur = self._conn.cursor()
-        rows = cur.execute("SELECT h.id, h.ts, h.hits, m.text, m.tags FROM hot h LEFT JOIN mem m ON h.id = m.id ORDER BY h.hits DESC, h.ts DESC LIMIT ?", (limit,)).fetchall()
-        out = []
-        for mid, ts, hits, text, tags in rows:
-            out.append({"id": mid, "ts": ts, "hits": hits, "text": text or "", "tags": (tags.split(',') if tags else [])})
-        return out
-
-    def get_cached(self, prompt: str, ttl_sec: int = 600) -> Optional[str]:
-        key = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-        ent = self._cache.get(key)
-        if not ent:
-            return None
-        try:
-            if time.time() - float(ent.get("t", 0)) <= ttl_sec:
-                return ent.get("out")
-        except Exception:
-            return None
-        return None
-
-    def set_cached(self, prompt: str, output: str):
-        key = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
-        self._cache[key] = {"t": time.time(), "out": output}
-        try:
-            self.cache_path.write_text(json.dumps(self._cache), encoding="utf-8")
-        except Exception:
-            pass
-
-    def compress_old(self):
-        return "ok"
-
-memmgr = MemoryManager(base)
+# The canonical table is authoritative. Embeddings and typed graph data are
+# rebuildable projections implemented in marven_local.memory.
+memmgr = CanonicalMemoryManager(base)
 
 # ---- MetaMirror Core Archive loader ----
 _CORE_ARCHIVE_DIR = base / "memory" / "core_archive"
@@ -1242,7 +1087,13 @@ def marven_response(user_input: str, session_id: str = "akeem", model: Optional[
     # Build memory context (RAG)
     boost = ["identity", "policy", "user-pref", "project", "LaborTracker", "QFAEN", "NEXA"]
     try:
-        top = memmgr.search(user_input, top_k=5, boost_tags=boost)
+        top = memmgr.search(
+            user_input,
+            top_k=5,
+            boost_tags=boost,
+            use_graph=True,
+            max_hops=2,
+        )
     except Exception:
         top = []
     for mid, _, __, ___ in top:
