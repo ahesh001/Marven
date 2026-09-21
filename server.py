@@ -1309,9 +1309,10 @@ def _local_caps_and_updater():
 
 
 def _proposal_path(name: object) -> Path:
-    if not isinstance(name, str) or not name.endswith(".patch") or Path(name).name != name:
+    if not isinstance(name, str) or not name.endswith(".patch"):
         raise SecurityValidationError("Invalid proposal name")
-    return resolve_path_within(marven_local.PROPOSALS_DIR, name)  # type: ignore[union-attr]
+    stem = validate_identifier(name[:-6], field="proposal name", max_length=160)
+    return resolve_path_within(marven_local.PROPOSALS_DIR, f"{stem}.patch")  # type: ignore[union-attr]
 
 
 @app.get("/api/local/capabilities")
