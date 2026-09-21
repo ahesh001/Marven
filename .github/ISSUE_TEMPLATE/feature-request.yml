@@ -1,0 +1,112 @@
+# Marven GitHub Issue Form
+name: Feature Request
+description: Suggest a focused improvement to Marven.
+title: "[Feature]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for proposing an improvement. Strong requests start with a clear user problem and preserve Marven's local-first, user-sovereign trust model.
+
+        Do not include private conversations, memory archives, personal data, credentials, or proprietary material.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem or use case
+      description: Who needs this, what are they trying to accomplish, and what blocks them today?
+      placeholder: When I ..., I need ..., because ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the behavior you would like Marven to provide.
+      placeholder: Explain the user flow, inputs, outputs, and important defaults.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Project area
+      description: Select the area that would own most of this work.
+      options:
+        - Core runtime or CLI
+        - Flask API or services
+        - React web client
+        - Memory, MetaMirror, or retrieval
+        - Evidence graph or Brain Tour
+        - Ollama, vLLM, or model routing
+        - Voice, ASR, TTS, or presence
+        - Capability policy, privacy, or safety
+        - Installation, packaging, or developer experience
+        - Mobile experience
+        - Other or cross-cutting
+    validations:
+      required: true
+
+  - type: textarea
+    id: experience
+    attributes:
+      label: Desired experience
+      description: Walk through how a person would discover, configure, and use the feature.
+      placeholder: Describe the successful end-to-end experience.
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: What workarounds or competing designs have you tried or considered?
+    validations:
+      required: false
+
+  - type: dropdown
+    id: trust-model
+    attributes:
+      label: Local-first and trust implications
+      description: How does the proposal interact with Marven's privacy and control boundaries?
+      options:
+        - Keeps personal data and inference local
+        - Adds an optional external service or integration
+        - Changes permissions, autonomy, or another trust boundary
+        - No direct impact
+        - Unsure and needs design review
+    validations:
+      required: true
+
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Success criteria
+      description: List observable outcomes that would make this feature complete and useful.
+      placeholder: |
+        - A user can ...
+        - Marven does not ...
+        - The result is measured by ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context or mockups
+      description: Add related issues, diagrams, screenshots, research, or implementation notes.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Submission checklist
+      options:
+        - label: I searched existing issues and did not find this request.
+          required: true
+        - label: This request explains the user problem, not only a preferred implementation.
+          required: true
+        - label: I removed private, sensitive, and proprietary material.
+          required: true

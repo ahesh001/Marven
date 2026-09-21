@@ -1,0 +1,114 @@
+# Marven GitHub Issue Form
+name: Research & Architecture Proposal
+description: Propose a Marven experiment, architectural change, or evidence-backed design.
+title: "[Research]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Use this form for substantial experiments and architectural ideas involving Marven's memory, retrieval, model orchestration, voice, presence, privacy, safety, or evaluation systems.
+
+        Keep the proposal testable. Link to sources instead of copying long passages, and never include private user data, credentials, memory archives, proprietary weights, or restricted material.
+
+  - type: textarea
+    id: question
+    attributes:
+      label: Research question or architectural proposal
+      description: State the idea as a focused question, hypothesis, or design change.
+      placeholder: We propose ... because ...; we expect ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: subsystem
+    attributes:
+      label: Primary subsystem
+      description: Select the part of Marven most affected by the proposal.
+      options:
+        - Canonical memory or provenance
+        - Retrieval, ranking, or context assembly
+        - Evidence graph or Brain Tour
+        - Model orchestration or local inference
+        - Human-state modeling or MetaMirror
+        - Voice, multimodal interaction, or presence
+        - Privacy, security, capability policy, or governance
+        - Evaluation, benchmarks, or observability
+        - Other or cross-cutting
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation and expected value
+      description: What current limitation does this address, and who benefits if it works?
+    validations:
+      required: true
+
+  - type: textarea
+    id: design
+    attributes:
+      label: Proposed design or experiment
+      description: Describe components, data flow, boundaries, dependencies, and the smallest useful test.
+      placeholder: Include enough detail for another contributor to evaluate or reproduce the approach.
+    validations:
+      required: true
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Evidence and references
+      description: Link to relevant papers, implementations, benchmarks, prior issues, or measured observations. Briefly explain why each matters.
+      placeholder: Add links and concise annotations; do not paste long copyrighted passages.
+    validations:
+      required: false
+
+  - type: textarea
+    id: evaluation
+    attributes:
+      label: Evaluation and success criteria
+      description: Define metrics, baselines, test data, and what result would support or reject the proposal.
+      placeholder: Specify measurable outcomes and a falsifiable stopping rule.
+    validations:
+      required: true
+
+  - type: textarea
+    id: risks
+    attributes:
+      label: Risks, limitations, and trust boundaries
+      description: Consider privacy, security, consent, autonomy, latency, resource use, bias, failure modes, migration, and rollback.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: maturity
+    attributes:
+      label: Current maturity
+      options:
+        - Early idea for discussion
+        - Design informed by existing research
+        - Prototype exists outside Marven
+        - Marven proof of concept is ready
+        - Looking for collaborators
+    validations:
+      required: true
+
+  - type: textarea
+    id: implementation
+    attributes:
+      label: Implementation outline
+      description: Identify likely modules, milestones, compatibility concerns, or migration work if known.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Submission checklist
+      options:
+        - label: This proposal is relevant to Marven and is meaningfully different from existing issues.
+          required: true
+        - label: Claims and references are represented accurately to the best of my knowledge.
+          required: true
+        - label: I included no private data, credentials, proprietary model weights, or material I lack permission to share.
+          required: true

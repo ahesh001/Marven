@@ -1,0 +1,135 @@
+# Marven GitHub Issue Form
+name: Bug Report
+description: Report a reproducible problem in Marven.
+title: "[Bug]: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for helping improve Marven. Please provide enough detail for someone else to reproduce the problem.
+
+        **Protect your privacy:** remove API keys, credentials, private conversations, memory archives, audit records, personal data, model weights, signing material, and other secrets before submitting.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Problem summary
+      description: Briefly describe the problem and its impact.
+      placeholder: What went wrong, and what were you trying to do?
+    validations:
+      required: true
+
+  - type: dropdown
+    id: component
+    attributes:
+      label: Affected component
+      description: Select the area most closely related to the problem.
+      options:
+        - Core runtime or CLI
+        - Flask API or services
+        - React web client
+        - Memory, MetaMirror, or retrieval
+        - Evidence graph or Brain Tour
+        - Ollama, vLLM, or model routing
+        - Voice, ASR, or TTS
+        - Capability policy or self-update
+        - Installation, build, or tests
+        - Other or unsure
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Marven version or commit
+      description: Provide a release tag, branch and commit SHA, or image/package version.
+      placeholder: "Example: main at 1a2b3c4 or v0.3.0"
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: Include the details that affect reproducibility. Write "not applicable" where needed.
+      value: |
+        - OS:
+        - Python:
+        - Node.js:
+        - Inference backend (Ollama, vLLM, or other):
+        - Model:
+        - Hardware:
+        - Deployment method:
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Provide the smallest reliable sequence that triggers the problem.
+      placeholder: |
+        1. Configure ...
+        2. Run ...
+        3. Send or select ...
+        4. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+      description: What should Marven have done?
+    validations:
+      required: true
+
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior
+      description: What happened instead? Include exact error text when it is safe to share.
+    validations:
+      required: true
+
+  - type: textarea
+    id: diagnostics
+    attributes:
+      label: Sanitized logs, screenshots, or other evidence
+      description: Drag in files or paste short excerpts. Redact all sensitive or identifying information first.
+      placeholder: Add only the evidence needed to diagnose this issue.
+    validations:
+      required: false
+
+  - type: dropdown
+    id: trust-impact
+    attributes:
+      label: Data, privacy, or security impact
+      description: Choose the closest match. Do not disclose an exploitable vulnerability in this public form.
+      options:
+        - No known impact
+        - Memory or personal-data impact
+        - Permission or security-boundary impact
+        - Unsure
+    validations:
+      required: true
+
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context
+      description: Add relevant configuration, related issues, or a possible cause or fix.
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: confirmations
+    attributes:
+      label: Submission checklist
+      options:
+        - label: I searched existing issues for the same problem.
+          required: true
+        - label: I removed credentials, private conversations, personal data, and other sensitive material.
+          required: true
+        - label: I identified the exact version or commit I tested.
+          required: true
