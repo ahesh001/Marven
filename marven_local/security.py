@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import http.client
 import ipaddress
+import os
 import socket
 import ssl
 from html.parser import HTMLParser
@@ -109,17 +110,17 @@ def resolve_path_within(root: Union[str, Path], user_path: Union[str, Path]) -> 
     Absolute paths are accepted only when they already point inside the root. Resolving
     before the containment check also prevents escapes through existing symlinks.
     """
-    root_path = Path(root).resolve()
-    raw = str(user_path)
-    if not raw or "\x00" in raw:
+    root_string = os.path.realpath(os.path.abspath(os.fspath(root)))
+    raw = os.fspath(user_path)
+    if not isinstance(raw, str) or not raw or "\x00" in raw:
         raise SecurityValidationError("Invalid path")
-    supplied = Path(raw)
-    candidate = supplied.resolve() if supplied.is_absolute() else (root_path / supplied).resolve()
-    try:
-        candidate.relative_to(root_path)
-    except ValueError as exc:
-        raise SecurityValidationError("Path outside allowed directory") from exc
-    return candidate
+    candidate = os.path.realpath(os.path.abspath(os.path.join(root_string, raw)))
+    if candidate == root_string:
+        return Path(root_string)
+    root_prefix = root_string if root_string.endswith(os.sep) else root_string + os.sep
+    if not candidate.startswith(root_prefix):
+        raise SecurityValidationError("Path outside allowed directory")
+    return Path(candidate)
 
 
 def _host_header(host: str, port: int, scheme: str) -> str:
@@ -210,6 +211,7 @@ def _open_pinned(
             raw_socket = socket.create_connection((address, port), timeout=timeout)
             if parsed.scheme == "https":
                 context = ssl.create_default_context()
+                context.minimum_version = ssl.TLSVersion.TLSv1_2
                 connection.sock = context.wrap_socket(raw_socket, server_hostname=host)
             else:
                 connection.sock = raw_socket
