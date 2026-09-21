@@ -94,21 +94,51 @@ This implements Marven's admission rule:
 ## Local API
 
 - `GET /api/memory/top` accepts `workspace_id`, `owner_id`, `agent_id`, and
-  `session_id` and returns hybrid and graph score components.
+  `session_id` and returns hybrid and graph score components. Retrieval capture
+  is off by default; add `capture=plaintext` for a reusable label run or
+  `capture=hash-only` for an audit-only run without stored query text.
 - `GET /api/memory/graph` requires the same owner boundary for graph inspection.
 - `POST /api/memory/proposals` creates a pending proposal.
 - `GET /api/memory/proposals` lists scoped proposals.
 - `POST /api/memory/proposals/<id>/approve` admits a proposal to canonical memory.
 - `POST /api/memory/proposals/<id>/reject` rejects it without creating memory.
+- `GET /api/memory/retrieval/runs` lists scoped label runs.
+- `POST /api/memory/retrieval/labels` creates or corrects a `0`–`3` relevance
+  judgment. A relevant memory missed by the returned top-k can be added with a
+  grade of `2` or `3`.
+- `GET /api/memory/retrieval/export` exports labeled plaintext-query runs by
+  default. The export contains canonical IDs and ranking metadata, not memory
+  text.
+- `DELETE /api/memory/retrieval/runs/<id>` deletes a captured query and its labels.
 
 These routes remain prototype-local interfaces. Authentication and server-side
 principal binding are required before using them as a production mobile or
 multi-user API.
 
+## Retrieval label lifecycle
+
+Captured runs retain the query only when plaintext storage is explicitly
+selected. Both modes store a SHA-256 query hash, the scope, result IDs, safe
+score/path metadata, and the retrieval configuration. Labels use graded
+relevance: `0` irrelevant, `1` marginal, `2` relevant, and `3` essential.
+Repeated judgments from the same source and labeler update the existing label
+so mistakes can be corrected.
+
+Deleting a canonical memory removes its ID from saved result snapshots and
+deletes labels that referenced it. Deleting a retrieval run cascades to all of
+its labels. Query text and IDs can still be sensitive, so label databases and
+exports must remain local, access-controlled, and excluded from Git.
+
+Use `scripts/label_memory_retrieval.py` for interactive review and
+`scripts/export_retrieval_labels.py` for an offline dataset. See
+[Graphiti Evaluation Decision](GRAPHITI_EVALUATION.md) for the first shared
+comparison protocol.
+
 ## Why this is not a GNN
 
 Hybrid retrieval and bounded graph traversal establish a deterministic,
-explainable baseline. A future graph neural network may learn candidate, edge,
-or path scores only after Marven has labeled retrieval data and split-isolation
-tests. It must remain a disposable scorer over the canonical graph projection,
-not a second truth store.
+explainable baseline. Marven can now collect the labeled retrieval data needed
+to test later systems, but label volume and split isolation still have to be
+earned. A future graph neural network may learn candidate, edge, or path scores
+only after those gates pass. It must remain a disposable scorer over the
+canonical graph projection, not a second truth store.

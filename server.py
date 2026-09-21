@@ -1654,8 +1654,22 @@ def api_memory_top():
         owner_id = request.args.get("owner_id")
         agent_id = request.args.get("agent_id")
         session_id = request.args.get("session_id")
-        use_graph = request.args.get("graph", "true").strip().lower() not in {"0", "false", "no", "off"}
+        use_graph = request.args.get("graph", "true").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
         max_hops = max(0, min(int(request.args.get("hops", 2)), 4))
+        capture_value = request.args.get("capture", "").strip().lower()
+        if capture_value in {"1", "true", "yes", "plaintext"}:
+            capture_mode = "plaintext"
+        elif capture_value in {"hash", "hash-only"}:
+            capture_mode = "hash-only"
+        elif capture_value in {"", "0", "false", "no", "off"}:
+            capture_mode = None
+        else:
+            raise ValueError("invalid retrieval capture mode")
         rows = marven.memmgr.search_evidence(
             q,
             top_k=max(1, min(k, 20)),
@@ -1672,6 +1686,28 @@ def api_memory_top():
             consent_scope=request.args.get("consent_scope"),
             visibility=request.args.get("visibility"),
         )
+        retrieval_run_id = None
+        if capture_mode is not None:
+            retrieval_run_id = marven.memmgr.record_retrieval_run(
+                q,
+                rows,
+                workspace_id=workspace_id,
+                owner_id=owner_id,
+                agent_id=agent_id,
+                session_id=session_id,
+                query_storage=capture_mode,
+                top_k=max(1, min(k, 20)),
+                retrieval_config={
+                    "use_graph": use_graph,
+                    "max_hops": max_hops,
+                    "boost_tags": boost or [],
+                    "as_of": request.args.get("as_of"),
+                    "time_start": request.args.get("time_start"),
+                    "time_end": request.args.get("time_end"),
+                    "consent_scope": request.args.get("consent_scope"),
+                    "visibility": request.args.get("visibility"),
+                },
+            )
         out = [
             {
                 "id": row["id"],
@@ -1716,11 +1752,110 @@ def api_memory_top():
                     "maxHops": max_hops,
                     "fusion": "rrf",
                 },
+                "retrievalRunId": retrieval_run_id,
                 "top": out,
             }
         )
+    except ValueError:
+        return _json_failure("Invalid memory search request.", 400, "Memory search failed")
     except Exception:
         return _json_failure("Unable to search memory.", 500, "Memory search failed")
+
+
+@app.get("/api/memory/retrieval/runs")
+def api_memory_retrieval_runs():
+    try:
+        include_hash_only = request.args.get("include_hash_only", "true").strip().lower() not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        labeled_only = request.args.get("labeled_only", "false").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        runs = marven.memmgr.list_retrieval_runs(
+            workspace_id=request.args.get("workspace_id"),
+            owner_id=request.args.get("owner_id"),
+            labeled_only=labeled_only,
+            include_hash_only=include_hash_only,
+            limit=request.args.get("limit", 100),
+        )
+        return jsonify({"runs": runs})
+    except (TypeError, ValueError):
+        return _json_failure("Invalid retrieval-run query.", 400, "Retrieval-run query failed")
+    except Exception:
+        return _json_failure("Unable to load retrieval runs.", 500, "Retrieval-run query failed")
+
+
+@app.post("/api/memory/retrieval/labels")
+def api_memory_retrieval_label_create():
+    try:
+        data = request.get_json() or {}
+        label = marven.memmgr.label_retrieval_result(
+            data.get("run_id", data.get("runId", "")),
+            data.get("memory_id", data.get("memoryId", "")),
+            data.get("relevance"),
+            workspace_id=data.get("workspace_id", data.get("workspaceId")),
+            owner_id=data.get("owner_id", data.get("ownerId")),
+            label_source=data.get("label_source", data.get("labelSource", "human")),
+            labeler_id=data.get("labeler_id", data.get("labelerId", "")),
+            note=data.get("note", ""),
+        )
+        return jsonify({"label": label}), 201
+    except (TypeError, ValueError):
+        return _json_failure("Invalid retrieval label.", 400, "Retrieval labeling failed")
+    except Exception:
+        return _json_failure("Unable to save retrieval label.", 500, "Retrieval labeling failed")
+
+
+@app.get("/api/memory/retrieval/export")
+def api_memory_retrieval_export():
+    try:
+        include_hash_only = request.args.get("include_hash_only", "false").strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        dataset = marven.memmgr.export_retrieval_labels(
+            workspace_id=request.args.get("workspace_id"),
+            owner_id=request.args.get("owner_id"),
+            include_hash_only=include_hash_only,
+        )
+        return jsonify(dataset)
+    except ValueError:
+        return _json_failure("Invalid retrieval export request.", 400, "Retrieval export failed")
+    except Exception:
+        return _json_failure("Unable to export retrieval labels.", 500, "Retrieval export failed")
+
+
+@app.delete("/api/memory/retrieval/runs/<run_id>")
+def api_memory_retrieval_run_delete(run_id):
+    try:
+        deleted = marven.memmgr.delete_retrieval_run(
+            run_id,
+            workspace_id=request.args.get("workspace_id"),
+            owner_id=request.args.get("owner_id"),
+        )
+        if not deleted:
+            return _json_failure("Retrieval run not found.", 404, "Retrieval-run deletion failed")
+        return jsonify({"status": "deleted", "retrievalRunId": run_id})
+    except ValueError:
+        return _json_failure(
+            "Invalid retrieval-run deletion request.",
+            400,
+            "Retrieval-run deletion failed",
+        )
+    except Exception:
+        return _json_failure(
+            "Unable to delete retrieval run.",
+            500,
+            "Retrieval-run deletion failed",
+        )
 
 
 @app.get("/api/memory/graph")

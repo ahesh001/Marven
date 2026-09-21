@@ -418,3 +418,181 @@ def test_rejected_memory_proposal_never_reaches_canonical_memory(tmp_path):
     with pytest.raises(ValueError, match="already rejected"):
         manager.approve_memory_proposal(proposal_id)
     manager.close()
+
+
+def test_retrieval_runs_collect_scoped_correctable_labels(tmp_path):
+    manager = MemoryManager(tmp_path)
+    memory_id = manager.add_memory(
+        "Marven keeps canonical memory local by default.",
+        workspace_id="heshware",
+        owner_id="akeem",
+    )
+    results = manager.search_evidence(
+        "Where does Marven keep memory?",
+        workspace_id="heshware",
+        owner_id="akeem",
+        use_graph=False,
+    )
+    run_id = manager.record_retrieval_run(
+        "Where does Marven keep memory?",
+        results,
+        workspace_id="heshware",
+        owner_id="akeem",
+        query_storage="plaintext",
+        retrieval_config={"use_graph": False},
+    )
+
+    first = manager.label_retrieval_result(
+        run_id,
+        memory_id,
+        3,
+        workspace_id="heshware",
+        owner_id="akeem",
+        labeler_id="akeem",
+    )
+    corrected = manager.label_retrieval_result(
+        run_id,
+        memory_id,
+        2,
+        workspace_id="heshware",
+        owner_id="akeem",
+        labeler_id="akeem",
+        note="Relevant, but not the only supporting record.",
+    )
+    run = manager.get_retrieval_run(
+        run_id,
+        workspace_id="heshware",
+        owner_id="akeem",
+    )
+    exported = manager.export_retrieval_labels(
+        workspace_id="heshware",
+        owner_id="akeem",
+    )
+
+    assert first["id"] == corrected["id"]
+    assert corrected["relevance"] == 2
+    assert run["query"] == "Where does Marven keep memory?"
+    assert run["retrieval_config"] == {"use_graph": False}
+    assert len(run["labels"]) == 1
+    assert "text" not in run["results"][0]
+    assert exported["schema"] == "marven.retrieval-labels.v1"
+    assert exported["run_count"] == 1
+    assert manager.get_retrieval_run(
+        run_id,
+        workspace_id="heshware",
+        owner_id="someone-else",
+    ) is None
+    with pytest.raises(ValueError, match="unknown retrieval run"):
+        manager.label_retrieval_result(
+            run_id,
+            memory_id,
+            2,
+            workspace_id="heshware",
+            owner_id="someone-else",
+        )
+    manager.close()
+
+
+def test_hash_only_retrieval_run_requires_opt_in_for_export(tmp_path):
+    manager = MemoryManager(tmp_path)
+    manager.add_memory("The release codename is Silver Pine.")
+    results = manager.search_evidence("release codename")
+    run_id = manager.record_retrieval_run(
+        "release codename",
+        results,
+        query_storage="hash-only",
+    )
+    manager.label_retrieval_result(run_id, results[0]["id"], 3)
+
+    stored = manager.get_retrieval_run(run_id)
+    default_export = manager.export_retrieval_labels()
+    audit_export = manager.export_retrieval_labels(include_hash_only=True)
+
+    assert stored["query"] == ""
+    assert len(stored["query_hash"]) == 64
+    assert default_export["run_count"] == 0
+    assert audit_export["run_count"] == 1
+    manager.close()
+
+
+def test_retrieval_labels_can_mark_relevant_evidence_missed_by_top_k(tmp_path):
+    manager = MemoryManager(tmp_path)
+    first_id = manager.add_memory("The first retrieval candidate.")
+    missed_id = manager.add_memory("The essential evidence omitted from a simulated top result.")
+    results = manager.search_evidence("retrieval evidence", top_k=2)
+    captured_results = [row for row in results if row["id"] == first_id]
+    run_id = manager.record_retrieval_run(
+        "retrieval evidence",
+        captured_results,
+        query_storage="plaintext",
+        top_k=1,
+    )
+
+    missed = manager.label_retrieval_result(run_id, missed_id, 3)
+
+    assert missed["relevance"] == 3
+    with pytest.raises(ValueError, match="unreturned memory"):
+        manager.label_retrieval_result(run_id, missed_id, 0, labeler_id="second-review")
+    manager.close()
+
+
+def test_deleting_memory_scrubs_retrieval_snapshots_and_labels(tmp_path):
+    manager = MemoryManager(tmp_path)
+    memory_id = manager.add_memory("Remove this memory and its evaluation reference.")
+    results = manager.search_evidence("evaluation reference")
+    run_id = manager.record_retrieval_run(
+        "evaluation reference",
+        results,
+        query_storage="plaintext",
+    )
+    manager.label_retrieval_result(run_id, memory_id, 3)
+
+    assert manager.delete_memory(memory_id)
+    run = manager.get_retrieval_run(run_id)
+
+    assert memory_id not in run["result_ids"]
+    assert memory_id not in {item["memory_id"] for item in run["results"]}
+    assert run["labels"] == []
+    manager.close()
+
+
+def test_retrieval_capture_and_missed_labels_cannot_cross_session_scope(tmp_path):
+    manager = MemoryManager(tmp_path)
+    allowed_id = manager.add_memory(
+        "Evidence in the captured session.",
+        session_id="session-a",
+    )
+    outside_id = manager.add_memory(
+        "Evidence in a different session.",
+        session_id="session-b",
+    )
+    allowed_results = manager.search_evidence(
+        "captured session",
+        session_id="session-a",
+        use_graph=False,
+    )
+    outside_results = manager.search_evidence(
+        "different session",
+        session_id="session-b",
+        use_graph=False,
+    )
+    run_id = manager.record_retrieval_run(
+        "captured session",
+        allowed_results,
+        session_id="session-a",
+        query_storage="plaintext",
+    )
+
+    assert allowed_id in manager.get_retrieval_run(run_id)["result_ids"]
+    with pytest.raises(ValueError, match="session scope"):
+        manager.record_retrieval_run(
+            "invalid capture",
+            outside_results,
+            session_id="session-a",
+            query_storage="plaintext",
+        )
+    with pytest.raises(ValueError, match="session scope"):
+        manager.label_retrieval_result(run_id, outside_id, 3)
+    with pytest.raises(ValueError, match="must not be empty"):
+        manager.record_retrieval_run("   ", [], query_storage="hash-only")
+    manager.close()

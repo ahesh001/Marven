@@ -1,0 +1,2 @@
+# Isolated research dependency; do not add Graphiti to Marven's runtime path.
+graphiti-core==0.30.2

@@ -91,7 +91,7 @@ The compatibility method `search()` returns the original tuple shape, while Marv
 | --- | --- | --- |
 | Preserve enough value detail | Canonical text is retained; projections do not replace it with summaries | Compare round and session granularity |
 | Use multiple retrieval keys | Text is indexed with approved subject, tags, facts, keyphrases, events, and aliases | Add learned late-interaction reranking |
-| Support multi-session evidence | Graph paths connect memories through subjects, entities, tags, sources, and episodes | Measure Recall@k and NDCG by question type |
+| Support multi-session evidence | Graph paths connect memories through subjects, entities, tags, sources, and episodes; graded retrieval-label capture is implemented | Collect sufficient judgments, then measure Recall@k and NDCG by question type |
 | Handle knowledge updates | Explicit supersession chains and validity intervals suppress stale records | Add contradiction proposals for human review |
 | Make time first-class | Creation time, validity intervals, `as_of`, `time_start`, and `time_end` filters | Add natural-language time-range parsing |
 | Test abstention | Missing, rejected, deleted, expired, and stale evidence is withheld | Add an evidence threshold and explicit unknown response policy |
@@ -112,18 +112,29 @@ The adapter does not download data or call an external model. It compares flat a
 ## Local API
 
 - `GET /api/memory/top?q=...&workspace_id=...&owner_id=...&graph=true&hops=2` returns scoped hybrid evidence and graph paths.
+- `GET /api/memory/top?...&capture=plaintext` creates a labelable run; use
+  `capture=hash-only` when raw query retention is not appropriate.
 - `GET /api/memory/top?...&as_of=...&time_start=...&time_end=...` applies temporal scope.
 - `GET /api/memory/graph?memory_id=...&workspace_id=...&owner_id=...&hops=2&limit=200` returns a bounded owner projection for inspection or a future Brain Tour view.
 - `POST /api/memory/graph/rebuild` regenerates the graph from canonical records.
 - `POST /api/memory/proposals` creates a scoped candidate that cannot affect retrieval until approved.
 - `POST /api/memory/proposals/<id>/approve` or `/reject` records the admission decision.
+- `/api/memory/retrieval/*` routes list, label, export, and delete scoped
+  retrieval runs without duplicating canonical memory text.
+
+The isolated [Graphiti evaluation](GRAPHITI_EVALUATION.md) uses these same
+judgments to compare a temporal context graph with Marven's deterministic
+baseline. Graphiti is not a GNN and cannot write back to canonical memory.
 
 ## When to add a GNN
 
 The graph should become a GNN input only after Marven has:
 
 1. A versioned graph schema and stable admission policy.
-2. Labeled retrieval questions with evidence IDs, including LongMemEval-style update, temporal, and abstention cases.
+2. A sufficiently large, versioned set of labeled retrieval questions with
+   evidence IDs, including LongMemEval-style update, temporal, privacy, and
+   abstention cases. Label capture exists; collection and split design remain
+   in progress.
 3. Strong deterministic and vector baselines.
 4. Train, validation, and test splits that prevent one user's private history from leaking across splits.
 5. Evidence that learned node, edge, or path scoring improves recall and answer quality without increasing stale-memory or privacy failures.
