@@ -2,7 +2,7 @@
 
 Marven now has a deterministic graph projection over canonical SQLite memory. The canonical `mem` table remains the source of truth. Vector embeddings and graph nodes/edges are disposable retrieval structures that can be rebuilt without changing a memory record.
 
-This is intentionally a graph-first implementation, not a graph neural network. It applies the useful part of GNN-style message passing—information flowing across connected nodes—through bounded, typed traversal that is inspectable before Marven learns graph weights from data.
+This is intentionally a graph-first implementation, not a graph neural network. It applies the useful part of GNN-style message passing described in Google's [Intro to graph neural networks](https://www.youtube.com/watch?v=8owQBFAHw7E&t=493s)—information flowing across connected nodes—through bounded, typed traversal that is inspectable before Marven learns graph weights from data.
 
 ## Runtime flow
 

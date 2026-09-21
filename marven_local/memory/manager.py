@@ -23,6 +23,7 @@ import uuid
 
 GRAPH_PROJECTION_VERSION = "1"
 EMBEDDING_PROJECTION_VERSION = "2"
+MAX_GRAPH_VISITS_PER_SEED = 5000
 DEFAULT_GRAPH_EDGE_TYPES = frozenset(
     {
         "about",
@@ -776,6 +777,8 @@ class MemoryManager:
             queue = deque([(start, 0, seed_strength, [])])
             best: Dict[str, float] = {start: seed_strength}
             while queue:
+                if len(best) >= MAX_GRAPH_VISITS_PER_SEED:
+                    break
                 node_id, depth, strength, path = queue.popleft()
                 if depth >= max_hops:
                     continue
@@ -784,6 +787,8 @@ class MemoryManager:
                     next_strength = strength * float(edge["weight"]) * 0.85
                     if next_strength <= best.get(next_id, -1.0):
                         continue
+                    if len(best) >= MAX_GRAPH_VISITS_PER_SEED:
+                        break
                     next_path = path + [
                         {
                             "from": node_id,
