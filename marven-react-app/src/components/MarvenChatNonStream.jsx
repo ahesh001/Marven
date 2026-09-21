@@ -5,13 +5,7 @@ import FileBrowserPanel from "./FileBrowserPanel";
 import ProposalsPanel from "./ProposalsPanel";
 import PolicyPanel from "./PolicyPanel";
 import CommandBar from "./CommandBar";
-
-function randomSessionId() { return Math.random().toString(36).slice(2); }
-function uid(prefix = "") {
-  const rand = Math.random().toString(36).slice(2);
-  const ts = Date.now().toString(36);
-  return (prefix || "") + rand + "_" + ts;
-}
+import { secureId, secureSessionId } from "../lib/secureId";
 export default function MarvenChatNonStream({ model }) {
   const [messages, setMessages] = useState([
     { id: "welcome", content: "Hello! I'm Marven. How can I assist you today?", sender: "marven", timestamp: new Date() },
@@ -26,7 +20,7 @@ export default function MarvenChatNonStream({ model }) {
   const [showPolicy, setShowPolicy] = useState(false);
   const [brainUrl, setBrainUrl] = useState("");
   const [selfAware, setSelfAware] = useState(false);
-  const sessionId = useMemo(() => randomSessionId(), []);
+  const sessionId = useMemo(() => secureSessionId(), []);
   const endRef = useRef(null);
   const listRef = useRef(null);
   const [stickBottom, setStickBottom] = useState(true);
@@ -61,7 +55,7 @@ export default function MarvenChatNonStream({ model }) {
       return handleSend(next);
     }
     setInput("");
-    const userId = uid('u_');
+    const userId = secureId('u_');
     setMessages((prev) => [...prev, { id: userId, content: text || (images.length ? "[Images attached]" : files.length ? "[Files attached]" : ""), sender: "user", timestamp: new Date() }]);
     setIsSending(true);
     const controller = new AbortController();
@@ -72,21 +66,21 @@ export default function MarvenChatNonStream({ model }) {
           ...files,
           ...images.map((i) => ({ name: i.name || "image", type: "image/*", base64: i.b64 }))
         ];
-        const mid = uid('m_');
+        const mid = secureId('m_');
         setMessages((prev) => [...prev, { id: mid, content: "", sender: "marven", timestamp: new Date() }]);
         const out = await askMarvenAnalyzeFiles(text || "Analyze these attachments", combined, { model, sessionId, selfAware, signal: controller.signal });
         setMessages((prev) => prev.map((m) => (m.id === mid ? { ...m, content: out } : m)));
         return;
       }
       if (images.length) {
-        const mid = uid('m_');
+        const mid = secureId('m_');
         setMessages((prev) => [...prev, { id: mid, content: "", sender: "marven", timestamp: new Date() }]);
         const out = await askMarvenVision(text || "Describe the image", images.map((i) => i.b64), { model: model || "llava", sessionId, selfAware, signal: controller.signal });
         setMessages((prev) => prev.map((m) => (m.id === mid ? { ...m, content: out } : m)));
         return;
       }
       if (files.length) {
-        const mid = uid('m_');
+        const mid = secureId('m_');
         setMessages((prev) => [...prev, { id: mid, content: "", sender: "marven", timestamp: new Date() }]);
         const out = await askMarvenAnalyzeFiles(text || "Analyze these files", files, { model, sessionId, selfAware, signal: controller.signal });
         setMessages((prev) => prev.map((m) => (m.id === mid ? { ...m, content: out } : m)));
@@ -94,14 +88,14 @@ export default function MarvenChatNonStream({ model }) {
       }
       // Text non-streaming
       {
-        const mid = uid('m_');
+        const mid = secureId('m_');
         setMessages((prev) => [...prev, { id: mid, content: "", sender: "marven", timestamp: new Date() }]);
         const out = await askMarven(text, { model, sessionId, autoApply, selfAware, signal: controller.signal });
         setMessages((prev) => prev.map((m) => (m.id === mid ? { ...m, content: out } : m)));
         return;
       }
     } catch (err) {
-      const mid = uid('m_');
+      const mid = secureId('m_');
       setMessages((prev) => [...prev, { id: mid, content: `${err?.name === 'AbortError' ? 'Stopped.' : 'Error: ' + (err?.message || String(err))}`, sender: "marven", timestamp: new Date() }]);
     } finally {
       setIsSending(false);
@@ -273,7 +267,6 @@ export default function MarvenChatNonStream({ model }) {
     </div>
   );
 }
-
 
 
 

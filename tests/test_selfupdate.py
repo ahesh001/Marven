@@ -9,6 +9,7 @@ def test_update_roundtrip(tmp_path: pl.Path):
     cm = CapabilityManager(tmp_path, "t")
     su = SelfUpdater(tmp_path, cm)
     p = su.propose(target, "1", "2", "d", "2025-01-01T00:00:00+00:00")
+    assert all(ch.isascii() and (ch.isalnum() or ch in "_.-") for ch in p.name)
     su.sign_init()
     su.sign(p)
     assert su.apply_approved()

@@ -5,9 +5,9 @@ import getpass
 import hashlib
 import json
 import pathlib as pl
-from typing import Any
+from datetime import datetime, timezone
 from .caps import CapabilityError, CapabilityManager
-from .policy import Policy
+from ..security import resolve_path_within
 from ..utils.crypto import load_or_create_key, hmac_hex, verify_hmac
 
 @dc.dataclass
@@ -35,6 +35,7 @@ class SelfUpdater:
     def propose(self, target: pl.Path, search: str, replace: str, description: str, now_iso: str) -> pl.Path:
         if not self.policy.check("self.update"):
             raise CapabilityError("self.update disabled")
+        target = resolve_path_within(self.root, target)
         src = target.read_text(encoding="utf-8")
         if search not in src:
             raise ValueError("search not found")
@@ -44,7 +45,8 @@ class SelfUpdater:
         sha = hashlib.sha256(diff.encode("utf-8")).hexdigest()
         pid = hashlib.sha256((description+diff).encode("utf-8")).hexdigest()[:12]
         prop = Proposal(id=pid, time=now_iso, author=getpass.getuser(), description=description, target_file=str(target), sha256=sha, diff=diff, new_content_b64=base64.b64encode(updated.encode("utf-8")).decode("ascii"))
-        fname = f"{now_iso.replace(':','-')}_{pid}.patch"
+        timestamp_slug = "".join(ch if ch.isalnum() else "-" for ch in now_iso).strip("-")
+        fname = f"{timestamp_slug}_{pid}.patch"
         path = self.props / fname
         content = {"id": prop.id, "time": prop.time, "author": prop.author, "description": prop.description, "target_file": prop.target_file, "sha256": prop.sha256, "new_content_b64": prop.new_content_b64, "diff": prop.diff}
         path.write_text(json.dumps(content, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -52,6 +54,9 @@ class SelfUpdater:
         approve.write_text(json.dumps({"proposal": path.name, "expected_sha256": prop.sha256, "approved": False, "signature": ""}, indent=2), encoding="utf-8")
         self.caps.audit.write(self.caps.actor, "self.update.propose", True, {"proposal": str(path)})
         return path
+    def propose_edit_in_file(self, target: pl.Path, search: str, replace: str, description: str) -> pl.Path:
+        now_iso = datetime.now(timezone.utc).isoformat()
+        return self.propose(target, search, replace, description, now_iso)
     def sign_init(self):
         load_or_create_key(self.key_path)
     def sign(self, proposal_path: pl.Path):
@@ -80,8 +85,8 @@ class SelfUpdater:
                 if not verify_hmac(key, msg, ad.get("signature", "")):
                     self.caps.audit.write(self.caps.actor, "self.update.apply", False, {"proposal": p.name, "error": "bad signature"})
                     continue
-                target = pl.Path(pd["target_file"]).resolve()
-                if not self.policy.check("fs.write", path=target):
+                target = self.policy.resolve_path("fs.write", pd["target_file"])
+                if target is None:
                     self.caps.audit.write(self.caps.actor, "self.update.apply", False, {"proposal": p.name, "error": "write not allowed"})
                     continue
                 content = pd.get("new_content_b64", "")
