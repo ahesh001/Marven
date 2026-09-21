@@ -18,19 +18,19 @@ class CapabilityManager:
     def _log(self, action: str, ok: bool, **details):
         self.audit.write(self.actor, action, ok, details)
     def fs_list(self, path: str) -> List[str]:
-        p = self.policy.resolve_path("fs.read", pl.Path(path))
+        p = self.policy.resolve_path("fs.read", path)
         self._log("fs.list", p is not None, path=str(path))
         if p is None:
             raise CapabilityError("fs.read not permitted")
         return [str(x) for x in p.iterdir()]
     def fs_read(self, path: str) -> str:
-        p = self.policy.resolve_path("fs.read", pl.Path(path))
+        p = self.policy.resolve_path("fs.read", path)
         self._log("fs.read", p is not None, path=str(path))
         if p is None:
             raise CapabilityError("fs.read not permitted")
         return p.read_text(encoding="utf-8")
     def fs_write(self, path: str, content: str) -> str:
-        p = self.policy.resolve_path("fs.write", pl.Path(path))
+        p = self.policy.resolve_path("fs.write", path)
         self._log("fs.write", p is not None, path=str(path), size=len(content))
         if p is None:
             raise CapabilityError("fs.write not permitted")

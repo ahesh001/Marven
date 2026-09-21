@@ -1,6 +1,6 @@
 from __future__ import annotations
 import pathlib as pl
-from typing import Any, Dict, Optional, List
+from typing import Any, Dict, Optional, List, Union
 
 from ..security import resolve_path_within
 
@@ -54,14 +54,16 @@ class Policy:
                     allow.append(s[2:])
                     data["capabilities"][current]["allow_paths"] = allow
             self.data = data
-    def resolve_path(self, cap: str, path: pl.Path) -> Optional[pl.Path]:
+    def resolve_path(self, cap: str, path: Union[str, pl.Path]) -> Optional[pl.Path]:
         """Return an authorized, resolved path or ``None`` when access is denied."""
         cfg = self.data.get("capabilities", {}).get(cap, {})
         if not cfg or not cfg.get("enabled", False):
             return None
 
-        supplied = pl.Path(path)
-        candidate = supplied.resolve() if supplied.is_absolute() else (self.root / supplied).resolve()
+        try:
+            candidate = resolve_path_within(self.root, path)
+        except ValueError:
+            return None
         for allowed_path in cfg.get("allow_paths", []):
             allowed_root = pl.Path(allowed_path)
             if not allowed_root.is_absolute():
@@ -72,7 +74,7 @@ class Policy:
                 continue
         return None
 
-    def check(self, cap: str, path: Optional[pl.Path] = None) -> bool:
+    def check(self, cap: str, path: Optional[Union[str, pl.Path]] = None) -> bool:
         cfg = self.data.get("capabilities", {}).get(cap, {})
         if not cfg or not cfg.get("enabled", False):
             return False

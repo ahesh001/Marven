@@ -45,7 +45,8 @@ class SelfUpdater:
         sha = hashlib.sha256(diff.encode("utf-8")).hexdigest()
         pid = hashlib.sha256((description+diff).encode("utf-8")).hexdigest()[:12]
         prop = Proposal(id=pid, time=now_iso, author=getpass.getuser(), description=description, target_file=str(target), sha256=sha, diff=diff, new_content_b64=base64.b64encode(updated.encode("utf-8")).decode("ascii"))
-        fname = f"{now_iso.replace(':','-')}_{pid}.patch"
+        timestamp_slug = "".join(ch if ch.isalnum() else "-" for ch in now_iso).strip("-")
+        fname = f"{timestamp_slug}_{pid}.patch"
         path = self.props / fname
         content = {"id": prop.id, "time": prop.time, "author": prop.author, "description": prop.description, "target_file": prop.target_file, "sha256": prop.sha256, "new_content_b64": prop.new_content_b64, "diff": prop.diff}
         path.write_text(json.dumps(content, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -84,7 +85,7 @@ class SelfUpdater:
                 if not verify_hmac(key, msg, ad.get("signature", "")):
                     self.caps.audit.write(self.caps.actor, "self.update.apply", False, {"proposal": p.name, "error": "bad signature"})
                     continue
-                target = self.policy.resolve_path("fs.write", pl.Path(pd["target_file"]))
+                target = self.policy.resolve_path("fs.write", pd["target_file"])
                 if target is None:
                     self.caps.audit.write(self.caps.actor, "self.update.apply", False, {"proposal": p.name, "error": "write not allowed"})
                     continue
