@@ -2,7 +2,23 @@ import sqlite3
 
 import pytest
 
-from marven_local.memory import MemoryManager
+from marven_local.memory import EmbeddingProvider, MemoryManager
+
+
+class ZeroEmbeddingProvider(EmbeddingProvider):
+    """Makes lexical retrieval observable without a dense-signal advantage."""
+
+    @property
+    def identity(self):
+        return "test-zero-v1"
+
+    @property
+    def dimension(self):
+        return 4
+
+    def embed(self, text, *, purpose):
+        del text, purpose
+        return [0.0, 0.0, 0.0, 0.0]
 
 
 def test_graph_is_rebuildable_projection_over_canonical_memory(tmp_path):
@@ -174,6 +190,9 @@ def test_legacy_v1_database_is_migrated_in_place(tmp_path):
 
     assert migrated["memory_type"] == "episodic"
     assert migrated["consent_scope"] == "local"
+    assert migrated["workspace_id"] == "local"
+    assert migrated["owner_id"] == "primary"
+    assert migrated["agent_id"] == "marven"
     assert manager.search("legacy canonical", top_k=1)[0][0] == "legacy-1"
     assert any(
         node["canonical_id"] == "legacy-1" for node in manager.graph_snapshot()["nodes"]
@@ -186,4 +205,216 @@ def test_invalid_trust_state_is_rejected(tmp_path, trust_status):
     manager = MemoryManager(tmp_path)
     with pytest.raises(ValueError):
         manager.add_memory("Do not accept invalid governance state.", trust_status=trust_status)
+    manager.close()
+
+
+def test_owner_scope_isolates_search_get_and_graph_projection(tmp_path):
+    manager = MemoryManager(tmp_path)
+    alice_id = manager.add_memory(
+        "Alice keeps the cobalt release notebook.",
+        workspace_id="heshware",
+        owner_id="alice",
+        subject="release notebook",
+    )
+    bob_id = manager.add_memory(
+        "Bob keeps the amber release notebook.",
+        workspace_id="heshware",
+        owner_id="bob",
+        subject="release notebook",
+    )
+
+    alice_results = manager.search_evidence(
+        "release notebook",
+        workspace_id="heshware",
+        owner_id="alice",
+        top_k=10,
+    )
+    alice_snapshot = manager.graph_snapshot(
+        workspace_id="heshware",
+        owner_id="alice",
+    )
+
+    assert [row["id"] for row in alice_results] == [alice_id]
+    assert manager.get_memory(
+        bob_id,
+        workspace_id="heshware",
+        owner_id="alice",
+    ) is None
+    assert alice_snapshot["projection"]["canonical_count"] == 1
+    assert f"memory:{alice_id}" in {node["id"] for node in alice_snapshot["nodes"]}
+    assert f"memory:{bob_id}" not in {node["id"] for node in alice_snapshot["nodes"]}
+    with pytest.raises(ValueError):
+        manager.graph_snapshot(
+            memory_id=bob_id,
+            workspace_id="heshware",
+            owner_id="alice",
+        )
+    manager.close()
+
+
+def test_cross_owner_lineage_and_supersession_are_rejected(tmp_path):
+    manager = MemoryManager(tmp_path)
+    bob_id = manager.add_memory(
+        "Bob's private preference.",
+        workspace_id="heshware",
+        owner_id="bob",
+    )
+
+    with pytest.raises(ValueError, match="owner scope"):
+        manager.add_memory(
+            "Alice cannot derive from Bob's memory.",
+            workspace_id="heshware",
+            owner_id="alice",
+            lineage=[bob_id],
+        )
+    with pytest.raises(ValueError, match="owner scope"):
+        manager.add_memory(
+            "Alice cannot supersede Bob's memory.",
+            workspace_id="heshware",
+            owner_id="alice",
+            supersedes=[bob_id],
+        )
+    manager.close()
+
+
+def test_agent_and_session_filters_narrow_an_owner_scope(tmp_path):
+    manager = MemoryManager(tmp_path)
+    first_id = manager.add_memory(
+        "The first session selected a blue interface.",
+        agent_id="design-agent",
+        session_id="session-one",
+    )
+    manager.add_memory(
+        "The second session selected a green interface.",
+        agent_id="design-agent",
+        session_id="session-two",
+    )
+    manager.add_memory(
+        "A research agent evaluated interface accessibility.",
+        agent_id="research-agent",
+        session_id="session-one",
+    )
+
+    results = manager.search_evidence(
+        "interface",
+        agent_id="design-agent",
+        session_id="session-one",
+        top_k=10,
+    )
+
+    assert [row["id"] for row in results] == [first_id]
+    manager.close()
+
+
+def test_explicit_empty_owner_scope_is_rejected(tmp_path):
+    manager = MemoryManager(tmp_path)
+    with pytest.raises(ValueError, match="owner_id is required"):
+        manager.add_memory("Do not silently fall back scopes.", owner_id="")
+    with pytest.raises(ValueError, match="owner_id is required"):
+        manager.search_evidence("scope", owner_id="")
+    manager.close()
+
+
+def test_hybrid_retrieval_unions_lexical_candidates_before_graph(tmp_path):
+    manager = MemoryManager(tmp_path, embedding_provider=ZeroEmbeddingProvider())
+    if not manager._fts_enabled:
+        pytest.skip("SQLite was built without FTS5")
+    exact_id = manager.add_memory(
+        "The incident code is ORCHID-742 and requires a manual review.",
+        subject="incident response",
+    )
+    manager.add_memory(
+        "A routine release review completed successfully.",
+        subject="release process",
+    )
+
+    results = manager.search_evidence("ORCHID-742", top_k=2, use_graph=False)
+
+    assert results[0]["id"] == exact_id
+    assert results[0]["semantic_score"] == 0.0
+    assert results[0]["lexical_rank"] == 1
+    assert results[0]["lexical_score"] > 0
+    assert results[0]["retrieval"]["embedding_provider"] == "test-zero-v1"
+    manager.close()
+
+
+def test_lexical_projection_rebuild_and_delete_follow_canonical_state(tmp_path):
+    manager = MemoryManager(tmp_path, embedding_provider=ZeroEmbeddingProvider())
+    if not manager._fts_enabled:
+        pytest.skip("SQLite was built without FTS5")
+    memory_id = manager.add_memory("Remember the exact token NEBULA-991.")
+
+    status = manager.rebuild_projections()
+    before = manager.search_evidence("NEBULA-991", use_graph=False)
+    manager.delete_memory(memory_id)
+    after = manager.search_evidence("NEBULA-991", use_graph=False)
+
+    assert status["lexical_enabled"] is True
+    assert before[0]["id"] == memory_id
+    assert memory_id not in {row["id"] for row in after}
+    manager.close()
+
+
+def test_memory_proposal_requires_approval_before_retrieval(tmp_path):
+    manager = MemoryManager(tmp_path)
+    proposal_id = manager.propose_memory(
+        "Akeem prefers local-first memory processing.",
+        workspace_id="heshware",
+        owner_id="akeem",
+        session_id="session-42",
+        subject="memory preference",
+        trust_status="confirmed",
+        metadata={"entities": ["Akeem", "Marven"]},
+    )
+
+    before = manager.search_evidence(
+        "local-first memory",
+        workspace_id="heshware",
+        owner_id="akeem",
+    )
+    pending = manager.list_memory_proposals(
+        workspace_id="heshware",
+        owner_id="akeem",
+    )
+    canonical_id = manager.approve_memory_proposal(
+        proposal_id,
+        workspace_id="heshware",
+        owner_id="akeem",
+        decision_reason="User confirmed this preference.",
+    )
+    after = manager.search_evidence(
+        "local-first memory",
+        workspace_id="heshware",
+        owner_id="akeem",
+    )
+    decided = manager.get_memory_proposal(
+        proposal_id,
+        workspace_id="heshware",
+        owner_id="akeem",
+    )
+
+    assert before == []
+    assert [proposal["id"] for proposal in pending] == [proposal_id]
+    assert after[0]["id"] == canonical_id
+    assert decided["status"] == "approved"
+    assert decided["canonical_id"] == canonical_id
+    assert manager.list_memory_proposals(
+        workspace_id="heshware",
+        owner_id="someone-else",
+    ) == []
+    manager.close()
+
+
+def test_rejected_memory_proposal_never_reaches_canonical_memory(tmp_path):
+    manager = MemoryManager(tmp_path)
+    proposal_id = manager.propose_memory("This candidate should be rejected.")
+
+    assert manager.reject_memory_proposal(
+        proposal_id,
+        decision_reason="Unsupported by the source.",
+    )
+    assert manager.get_memory_proposal(proposal_id)["status"] == "rejected"
+    assert manager.search_evidence("candidate rejected") == []
+    with pytest.raises(ValueError, match="already rejected"):
+        manager.approve_memory_proposal(proposal_id)
     manager.close()

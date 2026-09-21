@@ -13,6 +13,7 @@ import datetime
 import hashlib
 import json
 import math
+import os
 from pathlib import Path
 import re
 import sqlite3
@@ -20,9 +21,14 @@ import struct
 from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 import uuid
 
+from .retrieval import EmbeddingProvider, embedding_provider_from_env
+from .scope import MemoryScope, normalize_scope_id
+
 
 GRAPH_PROJECTION_VERSION = "1"
-EMBEDDING_PROJECTION_VERSION = "2"
+EMBEDDING_PROJECTION_VERSION = "3"
+LEXICAL_PROJECTION_VERSION = "1"
+RRF_K = 60
 MAX_GRAPH_VISITS_PER_SEED = 5000
 DEFAULT_GRAPH_EDGE_TYPES = frozenset(
     {
@@ -44,6 +50,7 @@ DEFAULT_GRAPH_EDGE_TYPES = frozenset(
 )
 TRUST_STATES = frozenset({"confirmed", "unverified", "disputed", "rejected"})
 VISIBILITY_STATES = frozenset({"private", "shared", "public"})
+PROPOSAL_STATES = frozenset({"pending", "approved", "rejected"})
 
 
 def _utc_now() -> str:
@@ -109,13 +116,36 @@ def _json_object(value: Any) -> Dict[str, Any]:
 class MemoryManager:
     """SQLite-backed canonical memory with disposable search projections."""
 
-    def __init__(self, root: Path):
+    def __init__(
+        self,
+        root: Path,
+        *,
+        workspace_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        embedding_provider: Optional[EmbeddingProvider] = None,
+    ):
         self.root = Path(root)
         self.mem_dir = self.root / "memory"
         self.mem_dir.mkdir(parents=True, exist_ok=True)
         self.db_path = self.mem_dir / "marven_mem.db"
         self.cache_path = self.mem_dir / "prompt_cache.json"
-        self.dim = 256
+        self.default_scope = MemoryScope.create(
+            workspace_id
+            if workspace_id is not None
+            else os.environ.get("MARVEN_WORKSPACE_ID", "local"),
+            owner_id
+            if owner_id is not None
+            else os.environ.get("MARVEN_OWNER_ID", "primary"),
+            agent_id
+            if agent_id is not None
+            else os.environ.get("MARVEN_AGENT_ID", "marven"),
+        )
+        self.embedding_provider = embedding_provider or embedding_provider_from_env()
+        self.dim = int(self.embedding_provider.dimension)
+        if self.dim <= 0:
+            raise ValueError("embedding provider dimension must be positive")
+        self._fts_enabled = False
         self._conn = sqlite3.connect(str(self.db_path))
         self._conn.row_factory = sqlite3.Row
         self._conn.execute("PRAGMA journal_mode=WAL;")
@@ -123,6 +153,7 @@ class MemoryManager:
         self._conn.execute("PRAGMA foreign_keys=ON;")
         self._ensure_schema()
         self._ensure_embeddings()
+        self._ensure_lexical_projection()
         self.rebuild_graph_projection()
         try:
             cached = json.loads(self.cache_path.read_text(encoding="utf-8"))
@@ -138,6 +169,10 @@ class MemoryManager:
             """
             CREATE TABLE IF NOT EXISTS mem (
               id TEXT PRIMARY KEY,
+              workspace_id TEXT NOT NULL DEFAULT 'local',
+              owner_id TEXT NOT NULL DEFAULT 'primary',
+              agent_id TEXT NOT NULL DEFAULT 'marven',
+              session_id TEXT NOT NULL DEFAULT '',
               text TEXT NOT NULL,
               tags TEXT DEFAULT '',
               ts TEXT NOT NULL,
@@ -168,6 +203,10 @@ class MemoryManager:
 
             CREATE TABLE IF NOT EXISTS episodes (
               id INTEGER PRIMARY KEY AUTOINCREMENT,
+              workspace_id TEXT NOT NULL DEFAULT 'local',
+              owner_id TEXT NOT NULL DEFAULT 'primary',
+              agent_id TEXT NOT NULL DEFAULT 'marven',
+              session_id TEXT NOT NULL DEFAULT '',
               ts TEXT NOT NULL,
               role TEXT NOT NULL,
               content TEXT NOT NULL,
@@ -201,6 +240,35 @@ class MemoryManager:
               key TEXT PRIMARY KEY,
               value TEXT NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS memory_proposals (
+              id TEXT PRIMARY KEY,
+              workspace_id TEXT NOT NULL,
+              owner_id TEXT NOT NULL,
+              agent_id TEXT NOT NULL DEFAULT '',
+              session_id TEXT NOT NULL DEFAULT '',
+              text TEXT NOT NULL,
+              tags TEXT DEFAULT '',
+              proposed_at TEXT NOT NULL,
+              subject TEXT DEFAULT '',
+              memory_type TEXT DEFAULT 'episodic',
+              source TEXT DEFAULT 'user',
+              source_locator TEXT DEFAULT '',
+              valid_from TEXT,
+              valid_to TEXT,
+              confidence REAL DEFAULT 1.0,
+              trust_status TEXT DEFAULT 'unverified',
+              consent_scope TEXT DEFAULT 'local',
+              visibility TEXT DEFAULT 'private',
+              episode_id TEXT DEFAULT '',
+              lineage TEXT DEFAULT '[]',
+              supersedes TEXT DEFAULT '[]',
+              metadata TEXT DEFAULT '{}',
+              status TEXT NOT NULL DEFAULT 'pending',
+              decided_at TEXT,
+              decision_reason TEXT DEFAULT '',
+              canonical_id TEXT DEFAULT ''
+            );
             """
         )
 
@@ -210,6 +278,10 @@ class MemoryManager:
             row["name"] for row in self._conn.execute("PRAGMA table_info(mem)").fetchall()
         }
         additions = {
+            "workspace_id": "TEXT NOT NULL DEFAULT 'local'",
+            "owner_id": "TEXT NOT NULL DEFAULT 'primary'",
+            "agent_id": "TEXT NOT NULL DEFAULT 'marven'",
+            "session_id": "TEXT NOT NULL DEFAULT ''",
             "subject": "TEXT DEFAULT ''",
             "memory_type": "TEXT DEFAULT 'episodic'",
             "source": "TEXT DEFAULT 'user'",
@@ -227,37 +299,126 @@ class MemoryManager:
             "deleted_at": "TEXT",
             "metadata": "TEXT DEFAULT '{}'",
         }
+        missing_scope_columns = [
+            column
+            for column in ("workspace_id", "owner_id", "agent_id", "session_id")
+            if column not in existing
+        ]
         for column, declaration in additions.items():
             if column not in existing:
                 self._conn.execute(f"ALTER TABLE mem ADD COLUMN {column} {declaration}")
 
+        if missing_scope_columns:
+            scope_defaults = {
+                "workspace_id": self.default_scope.workspace_id,
+                "owner_id": self.default_scope.owner_id,
+                "agent_id": self.default_scope.agent_id,
+                "session_id": "",
+            }
+            self._conn.execute(
+                "UPDATE mem SET "
+                + ", ".join(f"{column} = ?" for column in missing_scope_columns),
+                tuple(scope_defaults[column] for column in missing_scope_columns),
+            )
+
+        episode_existing = {
+            row["name"] for row in self._conn.execute("PRAGMA table_info(episodes)").fetchall()
+        }
+        episode_scope_additions = {
+            "workspace_id": "TEXT NOT NULL DEFAULT 'local'",
+            "owner_id": "TEXT NOT NULL DEFAULT 'primary'",
+            "agent_id": "TEXT NOT NULL DEFAULT 'marven'",
+            "session_id": "TEXT NOT NULL DEFAULT ''",
+        }
+        missing_episode_scope = [
+            column for column in episode_scope_additions if column not in episode_existing
+        ]
+        for column, declaration in episode_scope_additions.items():
+            if column not in episode_existing:
+                self._conn.execute(f"ALTER TABLE episodes ADD COLUMN {column} {declaration}")
+        if missing_episode_scope:
+            scope_defaults = {
+                "workspace_id": self.default_scope.workspace_id,
+                "owner_id": self.default_scope.owner_id,
+                "agent_id": self.default_scope.agent_id,
+                "session_id": "",
+            }
+            self._conn.execute(
+                "UPDATE episodes SET "
+                + ", ".join(f"{column} = ?" for column in missing_episode_scope),
+                tuple(scope_defaults[column] for column in missing_episode_scope),
+            )
+
         self._conn.executescript(
             """
             CREATE INDEX IF NOT EXISTS idx_mem_ts ON mem(ts);
+            CREATE INDEX IF NOT EXISTS idx_mem_scope
+              ON mem(workspace_id, owner_id, agent_id, session_id, deleted_at);
             CREATE INDEX IF NOT EXISTS idx_mem_tags ON mem(tags);
             CREATE INDEX IF NOT EXISTS idx_mem_subject ON mem(subject);
             CREATE INDEX IF NOT EXISTS idx_mem_episode ON mem(episode_id);
             CREATE INDEX IF NOT EXISTS idx_mem_superseded ON mem(superseded_by);
             CREATE INDEX IF NOT EXISTS idx_mem_deleted ON mem(deleted_at);
             CREATE INDEX IF NOT EXISTS idx_ep_ts ON episodes(ts);
+            CREATE INDEX IF NOT EXISTS idx_ep_scope
+              ON episodes(workspace_id, owner_id, agent_id, session_id, ts);
             CREATE INDEX IF NOT EXISTS idx_graph_edges_src ON memory_graph_edges(src_id);
             CREATE INDEX IF NOT EXISTS idx_graph_edges_dst ON memory_graph_edges(dst_id);
             CREATE INDEX IF NOT EXISTS idx_graph_nodes_canonical ON memory_graph_nodes(canonical_id);
+            CREATE INDEX IF NOT EXISTS idx_memory_proposal_scope
+              ON memory_proposals(workspace_id, owner_id, status, proposed_at);
             """
         )
+        fts_schema = """
+            CREATE VIRTUAL TABLE IF NOT EXISTS mem_fts USING fts5(
+              id UNINDEXED,
+              workspace_id UNINDEXED,
+              owner_id UNINDEXED,
+              agent_id UNINDEXED,
+              session_id UNINDEXED,
+              content,
+              tokenize='unicode61 remove_diacritics 2'
+            )
+        """
+        try:
+            self._conn.execute(fts_schema)
+            fts_columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(mem_fts)").fetchall()
+            }
+            expected_fts_columns = {
+                "id",
+                "workspace_id",
+                "owner_id",
+                "agent_id",
+                "session_id",
+                "content",
+            }
+            if not expected_fts_columns.issubset(fts_columns):
+                self._conn.execute("DROP TABLE mem_fts")
+                self._conn.execute(fts_schema)
+                self._conn.execute(
+                    "DELETE FROM memory_projection_meta WHERE key = 'lexical_version'"
+                )
+            self._fts_enabled = True
+        except sqlite3.OperationalError:
+            # Some minimal Python builds omit FTS5. Vector and graph retrieval
+            # remain available, and the API reports lexical search as disabled.
+            self._fts_enabled = False
         self._conn.commit()
 
-    def _embed(self, text: str) -> bytes:
-        vec = [0.0] * self.dim
-        if not text:
-            return struct.pack(f"{self.dim}f", *vec)
-        for token in re.findall(r"[\w'-]+", text.lower()):
-            digest = int(hashlib.sha1(token.encode("utf-8")).hexdigest(), 16)
-            index = digest % self.dim
-            sign = -1.0 if ((digest >> 8) & 1) else 1.0
-            vec[index] += sign
-        norm = math.sqrt(sum(value * value for value in vec)) or 1.0
-        return struct.pack(f"{self.dim}f", *(value / norm for value in vec))
+    def _embed(self, text: str, *, purpose: str) -> bytes:
+        vector = [
+            float(value)
+            for value in self.embedding_provider.embed(str(text or ""), purpose=purpose)
+        ]
+        if len(vector) != self.dim:
+            raise ValueError(
+                f"embedding provider returned {len(vector)} values; expected {self.dim}"
+            )
+        if not all(math.isfinite(value) for value in vector):
+            raise ValueError("embedding provider returned a non-finite value")
+        return struct.pack(f"{self.dim}f", *vector)
 
     def _unpack(self, blob: bytes) -> List[float]:
         return list(struct.unpack(f"{self.dim}f", blob))
@@ -265,6 +426,10 @@ class MemoryManager:
     def _row_to_record(self, row: sqlite3.Row) -> Dict[str, Any]:
         return {
             "id": row["id"],
+            "workspace_id": row["workspace_id"] or "local",
+            "owner_id": row["owner_id"] or "primary",
+            "agent_id": row["agent_id"] or "",
+            "session_id": row["session_id"] or "",
             "text": row["text"],
             "tags": [tag.strip() for tag in (row["tags"] or "").split(",") if tag.strip()],
             "created_at": row["ts"],
@@ -285,6 +450,36 @@ class MemoryManager:
             "superseded_by": row["superseded_by"] or "",
             "deleted_at": row["deleted_at"],
             "metadata": _json_object(row["metadata"]),
+        }
+
+    def _row_to_proposal(self, row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "id": row["id"],
+            "workspace_id": row["workspace_id"],
+            "owner_id": row["owner_id"],
+            "agent_id": row["agent_id"] or "",
+            "session_id": row["session_id"] or "",
+            "text": row["text"],
+            "tags": [tag.strip() for tag in (row["tags"] or "").split(",") if tag.strip()],
+            "proposed_at": row["proposed_at"],
+            "subject": row["subject"] or "",
+            "memory_type": row["memory_type"] or "episodic",
+            "source": row["source"] or "user",
+            "source_locator": row["source_locator"] or "",
+            "valid_from": row["valid_from"],
+            "valid_to": row["valid_to"],
+            "confidence": float(row["confidence"] if row["confidence"] is not None else 1.0),
+            "trust_status": row["trust_status"] or "unverified",
+            "consent_scope": row["consent_scope"] or "local",
+            "visibility": row["visibility"] or "private",
+            "episode_id": row["episode_id"] or "",
+            "lineage": _json_list(row["lineage"]),
+            "supersedes": _json_list(row["supersedes"]),
+            "metadata": _json_object(row["metadata"]),
+            "status": row["status"],
+            "decided_at": row["decided_at"],
+            "decision_reason": row["decision_reason"] or "",
+            "canonical_id": row["canonical_id"] or "",
         }
 
     def _index_text(self, record: Mapping[str, Any]) -> str:
@@ -309,14 +504,28 @@ class MemoryManager:
     def _write_embedding(self, memory_id: str, index_text: str) -> None:
         self._conn.execute(
             "INSERT OR REPLACE INTO emb(id, vector, dim) VALUES (?,?,?)",
-            (memory_id, sqlite3.Binary(self._embed(index_text)), self.dim),
+            (
+                memory_id,
+                sqlite3.Binary(self._embed(index_text, purpose="document")),
+                self.dim,
+            ),
+        )
+
+    @property
+    def _embedding_projection_version(self) -> str:
+        return (
+            f"{EMBEDDING_PROJECTION_VERSION}:"
+            f"{self.embedding_provider.identity}:{self.dim}"
         )
 
     def _ensure_embeddings(self) -> None:
         version_row = self._conn.execute(
             "SELECT value FROM memory_projection_meta WHERE key = 'embedding_version'"
         ).fetchone()
-        rebuild_all = version_row is None or version_row["value"] != EMBEDDING_PROJECTION_VERSION
+        rebuild_all = (
+            version_row is None
+            or version_row["value"] != self._embedding_projection_version
+        )
         if rebuild_all:
             self._conn.execute("DELETE FROM emb")
             rows = self._conn.execute(
@@ -338,25 +547,184 @@ class MemoryManager:
             self._write_embedding(record["id"], self._index_text(record))
         self._conn.execute(
             "INSERT OR REPLACE INTO memory_projection_meta(key, value) VALUES (?,?)",
-            ("embedding_version", EMBEDDING_PROJECTION_VERSION),
+            ("embedding_version", self._embedding_projection_version),
         )
         self._conn.commit()
 
-    def _validate_relation_ids(self, memory_ids: Sequence[str]) -> None:
+    def _write_lexical(self, record: Mapping[str, Any]) -> None:
+        if not self._fts_enabled:
+            return
+        self._conn.execute("DELETE FROM mem_fts WHERE id = ?", (record["id"],))
+        self._conn.execute(
+            """
+            INSERT INTO mem_fts(
+              id, workspace_id, owner_id, agent_id, session_id, content
+            ) VALUES (?,?,?,?,?,?)
+            """,
+            (
+                record["id"],
+                record["workspace_id"],
+                record["owner_id"],
+                record["agent_id"],
+                record["session_id"],
+                self._index_text(record),
+            ),
+        )
+
+    def _ensure_lexical_projection(self) -> None:
+        if not self._fts_enabled:
+            return
+        version_row = self._conn.execute(
+            "SELECT value FROM memory_projection_meta WHERE key = 'lexical_version'"
+        ).fetchone()
+        if version_row is None or version_row["value"] != LEXICAL_PROJECTION_VERSION:
+            with self._conn:
+                self._conn.execute("DELETE FROM mem_fts")
+                for row in self._conn.execute(
+                    "SELECT * FROM mem WHERE deleted_at IS NULL"
+                ).fetchall():
+                    self._write_lexical(self._row_to_record(row))
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO memory_projection_meta(key, value) VALUES (?,?)",
+                    ("lexical_version", LEXICAL_PROJECTION_VERSION),
+                )
+
+    def _lexical_search(
+        self,
+        query: str,
+        limit: int,
+        *,
+        workspace_id: str,
+        owner_id: str,
+        agent_id: Optional[str],
+        session_id: Optional[str],
+    ) -> List[Tuple[str, float]]:
+        if not self._fts_enabled:
+            return []
+        tokens = re.findall(r"[\w'-]+", str(query or ""), flags=re.UNICODE)[:32]
+        if not tokens:
+            return []
+        match_query = " OR ".join(
+            f'"{token.replace(chr(34), chr(34) * 2)}"' for token in tokens
+        )
+        conditions = [
+            "mem_fts MATCH ?",
+            "workspace_id = ?",
+            "owner_id = ?",
+        ]
+        params: List[Any] = [match_query, workspace_id, owner_id]
+        if agent_id is not None:
+            conditions.append("agent_id = ?")
+            params.append(agent_id)
+        if session_id is not None:
+            conditions.append("session_id = ?")
+            params.append(session_id)
+        params.append(int(limit))
+        try:
+            rows = self._conn.execute(
+                f"""
+                SELECT id, bm25(mem_fts) AS lexical_rank
+                FROM mem_fts
+                WHERE {' AND '.join(conditions)}
+                ORDER BY lexical_rank ASC, id ASC
+                LIMIT ?
+                """,
+                tuple(params),
+            ).fetchall()
+        except sqlite3.OperationalError:
+            return []
+        return [(str(row["id"]), float(row["lexical_rank"])) for row in rows]
+
+    def _resolve_boundary(
+        self,
+        workspace_id: Optional[str],
+        owner_id: Optional[str],
+    ) -> Tuple[str, str]:
+        return (
+            normalize_scope_id(
+                self.default_scope.workspace_id if workspace_id is None else workspace_id,
+                "workspace_id",
+                required=True,
+            ),
+            normalize_scope_id(
+                self.default_scope.owner_id if owner_id is None else owner_id,
+                "owner_id",
+                required=True,
+            ),
+        )
+
+    def _resolve_write_scope(
+        self,
+        workspace_id: Optional[str],
+        owner_id: Optional[str],
+        agent_id: Optional[str],
+        session_id: Optional[str],
+    ) -> MemoryScope:
+        boundary = self._resolve_boundary(workspace_id, owner_id)
+        selected_agent = self.default_scope.agent_id if agent_id is None else agent_id
+        return MemoryScope.create(
+            boundary[0],
+            boundary[1],
+            selected_agent,
+            session_id,
+        )
+
+    def _validate_relation_ids(
+        self,
+        memory_ids: Sequence[str],
+        scope: MemoryScope,
+    ) -> None:
         for memory_id in memory_ids:
             row = self._conn.execute(
-                "SELECT id, deleted_at FROM mem WHERE id = ?", (memory_id,)
+                """
+                SELECT id, workspace_id, owner_id, deleted_at
+                FROM mem
+                WHERE id = ?
+                """,
+                (memory_id,),
             ).fetchone()
             if row is None:
                 raise ValueError(f"unknown related memory: {memory_id}")
             if row["deleted_at"]:
                 raise ValueError(f"related memory is deleted: {memory_id}")
+            if (
+                row["workspace_id"] != scope.workspace_id
+                or row["owner_id"] != scope.owner_id
+            ):
+                raise ValueError("related memories must remain inside one owner scope")
 
-    def log_episode(self, role: str, content: str, meta: Optional[dict] = None) -> int:
+    def log_episode(
+        self,
+        role: str,
+        content: str,
+        meta: Optional[dict] = None,
+        *,
+        workspace_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> int:
+        scope = self._resolve_write_scope(
+            workspace_id, owner_id, agent_id, session_id
+        )
         timestamp = _utc_now()
         cursor = self._conn.execute(
-            "INSERT INTO episodes(ts, role, content, meta) VALUES (?,?,?,?)",
-            (timestamp, role, content or "", json.dumps(meta or {}, sort_keys=True)),
+            """
+            INSERT INTO episodes(
+              workspace_id, owner_id, agent_id, session_id,
+              ts, role, content, meta
+            ) VALUES (?,?,?,?,?,?,?,?)
+            """,
+            (
+                scope.workspace_id,
+                scope.owner_id,
+                scope.agent_id,
+                scope.session_id,
+                timestamp,
+                role,
+                content or "",
+                json.dumps(meta or {}, sort_keys=True),
+            ),
         )
         self._conn.commit()
         return int(cursor.lastrowid)
@@ -368,6 +736,10 @@ class MemoryManager:
         ts: Optional[str] = None,
         score: float = 0.0,
         *,
+        workspace_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        session_id: Optional[str] = None,
         subject: str = "",
         memory_type: str = "episodic",
         source: str = "user",
@@ -395,10 +767,13 @@ class MemoryManager:
         if not 0.0 <= float(confidence) <= 1.0:
             raise ValueError("confidence must be between 0 and 1")
 
+        scope = self._resolve_write_scope(
+            workspace_id, owner_id, agent_id, session_id
+        )
         clean_tags = _json_list(tags or [])
         lineage_ids = _json_list(lineage or [])
         superseded_ids = _json_list(supersedes or [])
-        self._validate_relation_ids(lineage_ids + superseded_ids)
+        self._validate_relation_ids(lineage_ids + superseded_ids, scope)
         for old_id in superseded_ids:
             old = self._conn.execute(
                 "SELECT superseded_by FROM mem WHERE id = ?", (old_id,)
@@ -411,6 +786,10 @@ class MemoryManager:
         metadata_obj = dict(metadata or {})
         record = {
             "id": memory_id,
+            "workspace_id": scope.workspace_id,
+            "owner_id": scope.owner_id,
+            "agent_id": scope.agent_id,
+            "session_id": scope.session_id,
             "text": text.strip(),
             "tags": clean_tags,
             "created_at": timestamp,
@@ -437,14 +816,19 @@ class MemoryManager:
             self._conn.execute(
                 """
                 INSERT INTO mem(
-                  id, text, tags, ts, score, subject, memory_type, source,
+                  id, workspace_id, owner_id, agent_id, session_id,
+                  text, tags, ts, score, subject, memory_type, source,
                   source_locator, valid_from, valid_to, confidence, trust_status,
                   consent_scope, visibility, episode_id, lineage, supersedes,
                   superseded_by, deleted_at, metadata
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     record["id"],
+                    record["workspace_id"],
+                    record["owner_id"],
+                    record["agent_id"],
+                    record["session_id"],
                     record["text"],
                     ",".join(record["tags"]),
                     record["created_at"],
@@ -468,6 +852,7 @@ class MemoryManager:
                 ),
             )
             self._write_embedding(memory_id, self._index_text(record))
+            self._write_lexical(record)
             for old_id in superseded_ids:
                 self._conn.execute(
                     """
@@ -477,19 +862,268 @@ class MemoryManager:
                           WHEN valid_to IS NULL OR valid_to = '' THEN ?
                           ELSE valid_to
                         END
-                    WHERE id = ?
+                    WHERE id = ? AND workspace_id = ? AND owner_id = ?
                     """,
-                    (memory_id, timestamp, old_id),
+                    (
+                        memory_id,
+                        timestamp,
+                        old_id,
+                        scope.workspace_id,
+                        scope.owner_id,
+                    ),
                 )
         if rebuild_graph:
             self.rebuild_graph_projection()
         return memory_id
 
-    def supersede_memory(self, memory_id: str, text: str, **overrides: Any) -> str:
-        current = self.get_memory(memory_id, include_deleted=False)
+    def propose_memory(
+        self,
+        text: str,
+        tags: Optional[List[str]] = None,
+        *,
+        workspace_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        subject: str = "",
+        memory_type: str = "episodic",
+        source: str = "user",
+        source_locator: str = "",
+        valid_from: Optional[str] = None,
+        valid_to: Optional[str] = None,
+        confidence: float = 1.0,
+        trust_status: str = "unverified",
+        consent_scope: str = "local",
+        visibility: str = "private",
+        episode_id: str = "",
+        lineage: Optional[Sequence[str]] = None,
+        supersedes: Optional[Sequence[str]] = None,
+        metadata: Optional[Mapping[str, Any]] = None,
+    ) -> str:
+        """Store a reviewable candidate without changing canonical memory."""
+
+        if not isinstance(text, str) or not text.strip():
+            raise ValueError("empty memory proposal text")
+        if trust_status not in TRUST_STATES:
+            raise ValueError(f"invalid trust status: {trust_status}")
+        if visibility not in VISIBILITY_STATES:
+            raise ValueError(f"invalid visibility: {visibility}")
+        if not isinstance(consent_scope, str) or not consent_scope.strip():
+            raise ValueError("consent scope is required")
+        if not 0.0 <= float(confidence) <= 1.0:
+            raise ValueError("confidence must be between 0 and 1")
+
+        scope = self._resolve_write_scope(
+            workspace_id, owner_id, agent_id, session_id
+        )
+        clean_tags = _json_list(tags or [])
+        lineage_ids = _json_list(lineage or [])
+        superseded_ids = _json_list(supersedes or [])
+        self._validate_relation_ids(lineage_ids + superseded_ids, scope)
+        proposal_id = f"proposal_{uuid.uuid4().hex[:12]}"
+        proposed_at = _utc_now()
+        self._conn.execute(
+            """
+            INSERT INTO memory_proposals(
+              id, workspace_id, owner_id, agent_id, session_id,
+              text, tags, proposed_at, subject, memory_type, source,
+              source_locator, valid_from, valid_to, confidence, trust_status,
+              consent_scope, visibility, episode_id, lineage, supersedes, metadata
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                proposal_id,
+                scope.workspace_id,
+                scope.owner_id,
+                scope.agent_id,
+                scope.session_id,
+                text.strip(),
+                ",".join(clean_tags),
+                proposed_at,
+                str(subject or "").strip(),
+                str(memory_type or "episodic").strip(),
+                str(source or "user").strip(),
+                str(source_locator or "").strip(),
+                valid_from,
+                valid_to,
+                float(confidence),
+                trust_status,
+                consent_scope.strip(),
+                visibility,
+                str(episode_id or "").strip(),
+                json.dumps(lineage_ids, sort_keys=True),
+                json.dumps(superseded_ids, sort_keys=True),
+                json.dumps(dict(metadata or {}), sort_keys=True),
+            ),
+        )
+        self._conn.commit()
+        return proposal_id
+
+    def get_memory_proposal(
+        self,
+        proposal_id: str,
+        *,
+        workspace_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        boundary = self._resolve_boundary(workspace_id, owner_id)
+        row = self._conn.execute(
+            """
+            SELECT * FROM memory_proposals
+            WHERE id = ? AND workspace_id = ? AND owner_id = ?
+            """,
+            (proposal_id, boundary[0], boundary[1]),
+        ).fetchone()
+        return self._row_to_proposal(row) if row else None
+
+    def list_memory_proposals(
+        self,
+        *,
+        status: Optional[str] = "pending",
+        workspace_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        limit: int = 100,
+    ) -> List[Dict[str, Any]]:
+        if status is not None and status not in PROPOSAL_STATES:
+            raise ValueError(f"invalid proposal status: {status}")
+        boundary = self._resolve_boundary(workspace_id, owner_id)
+        conditions = ["workspace_id = ?", "owner_id = ?"]
+        params: List[Any] = [boundary[0], boundary[1]]
+        if status is not None:
+            conditions.append("status = ?")
+            params.append(status)
+        if agent_id is not None:
+            conditions.append("agent_id = ?")
+            params.append(normalize_scope_id(agent_id, "agent_id", required=False))
+        if session_id is not None:
+            conditions.append("session_id = ?")
+            params.append(normalize_scope_id(session_id, "session_id", required=False))
+        params.append(max(1, min(int(limit), 1000)))
+        rows = self._conn.execute(
+            f"""
+            SELECT * FROM memory_proposals
+            WHERE {' AND '.join(conditions)}
+            ORDER BY proposed_at DESC, id DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+        return [self._row_to_proposal(row) for row in rows]
+
+    def approve_memory_proposal(
+        self,
+        proposal_id: str,
+        *,
+        workspace_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        decision_reason: str = "",
+    ) -> str:
+        proposal = self.get_memory_proposal(
+            proposal_id,
+            workspace_id=workspace_id,
+            owner_id=owner_id,
+        )
+        if proposal is None:
+            raise ValueError(f"unknown memory proposal: {proposal_id}")
+        if proposal["status"] != "pending":
+            raise ValueError(f"memory proposal is already {proposal['status']}")
+
+        canonical_id = self.add_memory(
+            proposal["text"],
+            tags=proposal["tags"],
+            workspace_id=proposal["workspace_id"],
+            owner_id=proposal["owner_id"],
+            agent_id=proposal["agent_id"],
+            session_id=proposal["session_id"],
+            subject=proposal["subject"],
+            memory_type=proposal["memory_type"],
+            source=proposal["source"],
+            source_locator=proposal["source_locator"],
+            valid_from=proposal["valid_from"],
+            valid_to=proposal["valid_to"],
+            confidence=proposal["confidence"],
+            trust_status=proposal["trust_status"],
+            consent_scope=proposal["consent_scope"],
+            visibility=proposal["visibility"],
+            episode_id=proposal["episode_id"],
+            lineage=proposal["lineage"],
+            supersedes=proposal["supersedes"],
+            metadata=proposal["metadata"],
+        )
+        with self._conn:
+            cursor = self._conn.execute(
+                """
+                UPDATE memory_proposals
+                SET status = 'approved', decided_at = ?, decision_reason = ?,
+                    canonical_id = ?
+                WHERE id = ? AND status = 'pending'
+                  AND workspace_id = ? AND owner_id = ?
+                """,
+                (
+                    _utc_now(),
+                    str(decision_reason or "").strip(),
+                    canonical_id,
+                    proposal_id,
+                    proposal["workspace_id"],
+                    proposal["owner_id"],
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise RuntimeError("memory proposal decision changed during approval")
+        return canonical_id
+
+    def reject_memory_proposal(
+        self,
+        proposal_id: str,
+        *,
+        workspace_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        decision_reason: str = "",
+    ) -> bool:
+        boundary = self._resolve_boundary(workspace_id, owner_id)
+        with self._conn:
+            cursor = self._conn.execute(
+                """
+                UPDATE memory_proposals
+                SET status = 'rejected', decided_at = ?, decision_reason = ?
+                WHERE id = ? AND status = 'pending'
+                  AND workspace_id = ? AND owner_id = ?
+                """,
+                (
+                    _utc_now(),
+                    str(decision_reason or "").strip(),
+                    proposal_id,
+                    boundary[0],
+                    boundary[1],
+                ),
+            )
+        return cursor.rowcount == 1
+
+    def supersede_memory(
+        self,
+        memory_id: str,
+        text: str,
+        *,
+        workspace_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        **overrides: Any,
+    ) -> str:
+        boundary = self._resolve_boundary(workspace_id, owner_id)
+        current = self.get_memory(
+            memory_id,
+            include_deleted=False,
+            workspace_id=boundary[0],
+            owner_id=boundary[1],
+        )
         if current is None:
             raise ValueError(f"unknown memory: {memory_id}")
         values = {
+            "workspace_id": current["workspace_id"],
+            "owner_id": current["owner_id"],
+            "agent_id": current["agent_id"],
+            "session_id": current["session_id"],
             "tags": current["tags"],
             "subject": current["subject"],
             "memory_type": current["memory_type"],
@@ -505,44 +1139,105 @@ class MemoryManager:
             "supersedes": [memory_id],
         }
         values.update(overrides)
+        if (
+            values["workspace_id"] != current["workspace_id"]
+            or values["owner_id"] != current["owner_id"]
+        ):
+            raise ValueError("a superseding memory cannot change owner scope")
         return self.add_memory(text, **values)
 
-    def delete_memory(self, memory_id: str, deleted_at: Optional[str] = None) -> bool:
+    def delete_memory(
+        self,
+        memory_id: str,
+        deleted_at: Optional[str] = None,
+        *,
+        workspace_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+    ) -> bool:
+        boundary = self._resolve_boundary(workspace_id, owner_id)
         timestamp = deleted_at or _utc_now()
         with self._conn:
             cursor = self._conn.execute(
-                "UPDATE mem SET deleted_at = ? WHERE id = ? AND deleted_at IS NULL",
-                (timestamp, memory_id),
+                """
+                UPDATE mem
+                SET deleted_at = ?
+                WHERE id = ? AND workspace_id = ? AND owner_id = ?
+                  AND deleted_at IS NULL
+                """,
+                (timestamp, memory_id, boundary[0], boundary[1]),
             )
-            self._conn.execute("DELETE FROM emb WHERE id = ?", (memory_id,))
-            self._conn.execute("DELETE FROM hot WHERE id = ?", (memory_id,))
+            if cursor.rowcount > 0:
+                self._conn.execute("DELETE FROM emb WHERE id = ?", (memory_id,))
+                if self._fts_enabled:
+                    self._conn.execute("DELETE FROM mem_fts WHERE id = ?", (memory_id,))
+                self._conn.execute("DELETE FROM hot WHERE id = ?", (memory_id,))
         self.rebuild_graph_projection()
         return cursor.rowcount > 0
 
-    def get_memory(self, memory_id: str, *, include_deleted: bool = False) -> Optional[Dict[str, Any]]:
-        query = "SELECT * FROM mem WHERE id = ?"
-        params: Tuple[Any, ...] = (memory_id,)
+    def get_memory(
+        self,
+        memory_id: str,
+        *,
+        include_deleted: bool = False,
+        workspace_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+    ) -> Optional[Dict[str, Any]]:
+        boundary = self._resolve_boundary(workspace_id, owner_id)
+        query = "SELECT * FROM mem WHERE id = ? AND workspace_id = ? AND owner_id = ?"
+        params: Tuple[Any, ...] = (memory_id, boundary[0], boundary[1])
         if not include_deleted:
             query += " AND deleted_at IS NULL"
         row = self._conn.execute(query, params).fetchone()
         return self._row_to_record(row) if row else None
 
-    def list_memories(self, *, include_deleted: bool = False) -> List[Dict[str, Any]]:
+    def list_memories(
+        self,
+        *,
+        include_deleted: bool = False,
+        workspace_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        boundary = self._resolve_boundary(workspace_id, owner_id)
+        query = "SELECT * FROM mem WHERE workspace_id = ? AND owner_id = ?"
+        params: List[Any] = [boundary[0], boundary[1]]
+        if not include_deleted:
+            query += " AND deleted_at IS NULL"
+        if agent_id is not None:
+            query += " AND agent_id = ?"
+            params.append(normalize_scope_id(agent_id, "agent_id", required=False))
+        if session_id is not None:
+            query += " AND session_id = ?"
+            params.append(normalize_scope_id(session_id, "session_id", required=False))
+        query += " ORDER BY ts ASC, id ASC"
+        return [
+            self._row_to_record(row)
+            for row in self._conn.execute(query, tuple(params)).fetchall()
+        ]
+
+    def _all_memories(self, *, include_deleted: bool = False) -> List[Dict[str, Any]]:
         query = "SELECT * FROM mem"
         if not include_deleted:
             query += " WHERE deleted_at IS NULL"
-        query += " ORDER BY ts ASC, id ASC"
+        query += " ORDER BY workspace_id, owner_id, ts ASC, id ASC"
         return [self._row_to_record(row) for row in self._conn.execute(query).fetchall()]
 
     @staticmethod
-    def _concept_id(node_type: str, value: str) -> str:
+    def _concept_id(
+        node_type: str,
+        value: str,
+        workspace_id: str,
+        owner_id: str,
+    ) -> str:
         normalized = " ".join(value.lower().split())
-        digest = hashlib.sha256(normalized.encode("utf-8")).hexdigest()[:16]
+        scoped_value = f"{workspace_id}\x00{owner_id}\x00{normalized}"
+        digest = hashlib.sha256(scoped_value.encode("utf-8")).hexdigest()[:16]
         return f"{node_type}:{digest}"
 
     def rebuild_graph_projection(self) -> Dict[str, Any]:
         """Rebuild graph tables exclusively from non-deleted canonical rows."""
-        records = self.list_memories(include_deleted=False)
+        records = self._all_memories(include_deleted=False)
         with self._conn:
             self._conn.execute("DELETE FROM memory_graph_edges")
             self._conn.execute("DELETE FROM memory_graph_nodes")
@@ -602,6 +1297,10 @@ class MemoryManager:
                     label,
                     memory_id,
                     {
+                        "workspace_id": record["workspace_id"],
+                        "owner_id": record["owner_id"],
+                        "agent_id": record["agent_id"],
+                        "session_id": record["session_id"],
                         "created_at": record["created_at"],
                         "memory_type": record["memory_type"],
                         "trust_status": record["trust_status"],
@@ -622,8 +1321,22 @@ class MemoryManager:
                     clean = " ".join(str(value).split())
                     if not clean:
                         return
-                    concept_node = self._concept_id(node_type, clean)
-                    put_node(concept_node, node_type, clean, attrs={"value": clean})
+                    concept_node = self._concept_id(
+                        node_type,
+                        clean,
+                        record["workspace_id"],
+                        record["owner_id"],
+                    )
+                    put_node(
+                        concept_node,
+                        node_type,
+                        clean,
+                        attrs={
+                            "value": clean,
+                            "workspace_id": record["workspace_id"],
+                            "owner_id": record["owner_id"],
+                        },
+                    )
                     evidence = {"canonical_id": memory_id, "field": field}
                     put_edge(memory_node, concept_node, forward_type, weight, evidence)
                     put_edge(concept_node, memory_node, reverse_type, weight, evidence)
@@ -695,17 +1408,33 @@ class MemoryManager:
         }
 
     def rebuild_projections(self) -> Dict[str, Any]:
-        """Rebuild both vector and graph projections from canonical memory."""
-        records = self.list_memories(include_deleted=False)
+        """Rebuild vector, lexical, and graph projections from canonical memory."""
+        records = self._all_memories(include_deleted=False)
         with self._conn:
             self._conn.execute("DELETE FROM emb")
+            if self._fts_enabled:
+                self._conn.execute("DELETE FROM mem_fts")
             for record in records:
                 self._write_embedding(record["id"], self._index_text(record))
+                self._write_lexical(record)
             self._conn.execute(
                 "INSERT OR REPLACE INTO memory_projection_meta(key, value) VALUES (?,?)",
-                ("embedding_version", EMBEDDING_PROJECTION_VERSION),
+                ("embedding_version", self._embedding_projection_version),
             )
-        return self.rebuild_graph_projection()
+            if self._fts_enabled:
+                self._conn.execute(
+                    "INSERT OR REPLACE INTO memory_projection_meta(key, value) VALUES (?,?)",
+                    ("lexical_version", LEXICAL_PROJECTION_VERSION),
+                )
+        graph_status = self.rebuild_graph_projection()
+        graph_status.update(
+            {
+                "embedding_provider": self.embedding_provider.identity,
+                "embedding_dimension": self.dim,
+                "lexical_enabled": self._fts_enabled,
+            }
+        )
+        return graph_status
 
     def _eligible(
         self,
@@ -816,6 +1545,10 @@ class MemoryManager:
         top_k: int = 5,
         boost_tags: Optional[List[str]] = None,
         *,
+        workspace_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        session_id: Optional[str] = None,
         use_graph: bool = True,
         max_hops: int = 2,
         max_neighbors: int = 50,
@@ -828,22 +1561,49 @@ class MemoryManager:
         visibility: Optional[str] = None,
         include_superseded: bool = False,
     ) -> List[Dict[str, Any]]:
-        top_k = max(1, int(top_k))
+        top_k = max(1, min(int(top_k), 1000))
         max_hops = max(0, min(int(max_hops), 4))
         max_neighbors = max(1, min(int(max_neighbors), 250))
         graph_weight = max(0.0, min(float(graph_weight), 1.0))
-        query_vector = self._unpack(self._embed(query or ""))
+        boundary = self._resolve_boundary(workspace_id, owner_id)
+        agent_filter = (
+            normalize_scope_id(agent_id, "agent_id", required=False)
+            if agent_id is not None
+            else None
+        )
+        session_filter = (
+            normalize_scope_id(session_id, "session_id", required=False)
+            if session_id is not None
+            else None
+        )
+        query_vector = self._unpack(
+            self._embed(query or "", purpose="query")
+        )
         boost_set = {tag.strip() for tag in (boost_tags or []) if tag.strip()}
+        conditions = [
+            "mem.deleted_at IS NULL",
+            "mem.workspace_id = ?",
+            "mem.owner_id = ?",
+        ]
+        params: List[Any] = [boundary[0], boundary[1]]
+        if agent_filter is not None:
+            conditions.append("mem.agent_id = ?")
+            params.append(agent_filter)
+        if session_filter is not None:
+            conditions.append("mem.session_id = ?")
+            params.append(session_filter)
         rows = self._conn.execute(
-            """
+            f"""
             SELECT mem.*, emb.vector
             FROM mem
             JOIN emb ON mem.id = emb.id
-            WHERE mem.deleted_at IS NULL
-            """
+            WHERE {' AND '.join(conditions)}
+            """,
+            tuple(params),
         ).fetchall()
 
-        scored: Dict[str, Dict[str, Any]] = {}
+        eligible_records: Dict[str, Dict[str, Any]] = {}
+        semantic_scores: Dict[str, float] = {}
         for row in rows:
             record = self._row_to_record(row)
             if not self._eligible(
@@ -858,34 +1618,114 @@ class MemoryManager:
                 continue
             vector = self._unpack(row["vector"])
             semantic_score = sum(left * right for left, right in zip(query_vector, vector))
+            eligible_records[record["id"]] = record
+            semantic_scores[record["id"]] = float(semantic_score)
+
+        if not eligible_records:
+            return []
+
+        candidate_limit = min(1000, max(60, top_k * 8))
+        semantic_order = sorted(
+            eligible_records,
+            key=lambda memory_id: (
+                semantic_scores[memory_id],
+                eligible_records[memory_id]["created_at"],
+                memory_id,
+            ),
+            reverse=True,
+        )[:candidate_limit]
+        semantic_ranks = {
+            memory_id: index
+            for index, memory_id in enumerate(semantic_order, start=1)
+        }
+
+        lexical_rows = self._lexical_search(
+            query,
+            candidate_limit,
+            workspace_id=boundary[0],
+            owner_id=boundary[1],
+            agent_id=agent_filter,
+            session_id=session_filter,
+        )
+        lexical_rows = [
+            item for item in lexical_rows if item[0] in eligible_records
+        ]
+        lexical_ranks = {
+            memory_id: index
+            for index, (memory_id, _) in enumerate(lexical_rows, start=1)
+        }
+        lexical_bm25 = dict(lexical_rows)
+        candidate_ids = set(semantic_ranks).union(lexical_ranks)
+
+        active_signal_count = 1 + int(bool(lexical_ranks))
+        maximum_rrf = active_signal_count / float(RRF_K + 1)
+
+        def score_record(memory_id: str) -> Dict[str, Any]:
+            record = dict(eligible_records[memory_id])
+            semantic_rank = semantic_ranks.get(memory_id)
+            lexical_rank = lexical_ranks.get(memory_id)
+            semantic_rrf = (
+                1.0 / (RRF_K + semantic_rank) if semantic_rank is not None else 0.0
+            )
+            lexical_rrf = (
+                1.0 / (RRF_K + lexical_rank) if lexical_rank is not None else 0.0
+            )
+            fusion_score = (semantic_rrf + lexical_rrf) / maximum_rrf
             tag_boost = 0.15 * len(boost_set.intersection(record["tags"]))
-            base_score = semantic_score + tag_boost + record["score"]
+            base_score = fusion_score + tag_boost + record["score"]
             record.update(
                 {
-                    "semantic_score": float(semantic_score),
+                    "semantic_score": semantic_scores[memory_id],
+                    "semantic_rank": semantic_rank,
+                    "lexical_score": (
+                        (RRF_K + 1) / float(RRF_K + lexical_rank)
+                        if lexical_rank is not None
+                        else 0.0
+                    ),
+                    "lexical_rank": lexical_rank,
+                    "lexical_bm25": lexical_bm25.get(memory_id),
+                    "fusion_score": float(fusion_score),
                     "tag_boost": float(tag_boost),
                     "base_score": float(base_score),
                     "graph_score": 0.0,
                     "score": float(base_score),
                     "graph_path": [],
+                    "retrieval": {
+                        "embedding_provider": self.embedding_provider.identity,
+                        "lexical_enabled": self._fts_enabled,
+                        "rrf_k": RRF_K,
+                    },
                 }
             )
-            scored[record["id"]] = record
+            return record
+
+        scored = {
+            memory_id: score_record(memory_id)
+            for memory_id in candidate_ids
+        }
 
         ordered_base = sorted(
             scored.values(), key=lambda item: (item["base_score"], item["created_at"]), reverse=True
         )
         if use_graph and max_hops > 0 and ordered_base:
             seed_count = min(len(ordered_base), max(5, top_k))
-            seeds = [(item["id"], item["semantic_score"]) for item in ordered_base[:seed_count]]
+            seeds = [
+                (
+                    item["id"],
+                    max(-1.0, min(1.0, (2.0 * item["fusion_score"]) - 1.0)),
+                )
+                for item in ordered_base[:seed_count]
+            ]
             affinity, paths = self._graph_affinity(
                 seeds,
-                scored.keys(),
+                eligible_records.keys(),
                 max_hops=max_hops,
                 max_neighbors=max_neighbors,
                 allowed_edge_types=allowed_edge_types or tuple(DEFAULT_GRAPH_EDGE_TYPES),
             )
             for memory_id, strength in affinity.items():
+                if memory_id not in scored:
+                    scored[memory_id] = score_record(memory_id)
                 contribution = graph_weight * strength
                 scored[memory_id]["graph_score"] = float(contribution)
                 scored[memory_id]["score"] = float(scored[memory_id]["base_score"] + contribution)
@@ -912,13 +1752,23 @@ class MemoryManager:
         self,
         memory_id: Optional[str] = None,
         *,
+        workspace_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
         max_hops: int = 2,
         limit: int = 200,
     ) -> Dict[str, Any]:
+        boundary = self._resolve_boundary(workspace_id, owner_id)
         limit = max(1, min(int(limit), 1000))
         max_hops = max(0, min(int(max_hops), 4))
         selected: Optional[set] = None
         if memory_id:
+            scoped_memory = self.get_memory(
+                memory_id,
+                workspace_id=boundary[0],
+                owner_id=boundary[1],
+            )
+            if scoped_memory is None:
+                raise ValueError(f"unknown memory graph node: {memory_id}")
             start = f"memory:{memory_id}"
             exists = self._conn.execute(
                 "SELECT 1 FROM memory_graph_nodes WHERE node_id = ?", (start,)
@@ -948,9 +1798,15 @@ class MemoryManager:
                 selected.update(frontier)
 
         if selected is None:
-            node_rows = self._conn.execute(
-                "SELECT * FROM memory_graph_nodes ORDER BY node_type, node_id LIMIT ?", (limit,)
+            all_node_rows = self._conn.execute(
+                "SELECT * FROM memory_graph_nodes ORDER BY node_type, node_id"
             ).fetchall()
+            node_rows = [
+                row
+                for row in all_node_rows
+                if _json_object(row["attrs"]).get("workspace_id") == boundary[0]
+                and _json_object(row["attrs"]).get("owner_id") == boundary[1]
+            ][:limit]
             selected = {row["node_id"] for row in node_rows}
         else:
             placeholders = ",".join("?" for _ in selected)
@@ -977,8 +1833,18 @@ class MemoryManager:
         for numeric in ("canonical_count",):
             if numeric in metadata:
                 metadata[numeric] = int(metadata[numeric])
+        metadata["canonical_count"] = int(
+            self._conn.execute(
+                """
+                SELECT COUNT(*) FROM mem
+                WHERE workspace_id = ? AND owner_id = ? AND deleted_at IS NULL
+                """,
+                boundary,
+            ).fetchone()[0]
+        )
         return {
             "projection": metadata,
+            "scope": {"workspace_id": boundary[0], "owner_id": boundary[1]},
             "nodes": [
                 {
                     "id": row["node_id"],
@@ -1001,7 +1867,20 @@ class MemoryManager:
             ],
         }
 
-    def record_hit(self, mem_id: str) -> None:
+    def record_hit(
+        self,
+        mem_id: str,
+        *,
+        workspace_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+    ) -> None:
+        boundary = self._resolve_boundary(workspace_id, owner_id)
+        if self.get_memory(
+            mem_id,
+            workspace_id=boundary[0],
+            owner_id=boundary[1],
+        ) is None:
+            raise ValueError(f"unknown memory in owner scope: {mem_id}")
         now = _utc_now()
         self._conn.execute(
             """
@@ -1021,17 +1900,26 @@ class MemoryManager:
             self._conn.execute("DELETE FROM hot WHERE id = ?", (row["id"],))
         self._conn.commit()
 
-    def list_hot(self, limit: int = 50) -> List[dict]:
+    def list_hot(
+        self,
+        limit: int = 50,
+        *,
+        workspace_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+    ) -> List[dict]:
+        boundary = self._resolve_boundary(workspace_id, owner_id)
         rows = self._conn.execute(
             """
             SELECT h.id, h.ts, h.hits, m.text, m.tags
             FROM hot h
             LEFT JOIN mem m ON h.id = m.id
             WHERE m.deleted_at IS NULL
+              AND m.workspace_id = ?
+              AND m.owner_id = ?
             ORDER BY h.hits DESC, h.ts DESC
             LIMIT ?
             """,
-            (int(limit),),
+            (boundary[0], boundary[1], int(limit)),
         ).fetchall()
         return [
             {

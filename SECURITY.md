@@ -82,6 +82,8 @@ Please allow a reasonable remediation period before public disclosure. If active
 Marven's default direction is local-first, but local execution is not automatically private or secure:
 
 - `server.py` is intended for local development and binds to localhost by default. Internet-facing or multi-tenant deployment is not currently supported.
+- Memory workspace/owner fields provide logical row and graph isolation, not authentication. A production API must derive those fields from an authenticated server-side principal and must never trust client-supplied owner identifiers.
+- Pending memory proposals are intentionally excluded from retrieval until approved. Any future automatic extractor must write proposals rather than bypassing the admission decision.
 - Ollama, vLLM, web access, speech services, proxies, hosted assets, and other configured integrations may transmit data outside the machine.
 - File, network, device, plugin, and self-update capabilities are experimental. Policy checks and approval files reduce risk but do not form a complete operating-system sandbox.
 - Retrieved content, uploaded files, webpages, tool output, model output, and stored memory must be treated as untrusted input.

@@ -189,7 +189,12 @@ def evaluate(
             skipped_abstention += 1
             continue
         with tempfile.TemporaryDirectory(prefix="marven-longmemeval-") as temp_dir:
-            manager = MemoryManager(Path(temp_dir))
+            manager = MemoryManager(
+                Path(temp_dir),
+                workspace_id="benchmark",
+                owner_id=question_id or "unknown-question",
+                agent_id="longmemeval-evaluator",
+            )
             _index_entry(manager, entry, granularity)
             example = {
                 "question_id": question_id,

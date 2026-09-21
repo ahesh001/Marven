@@ -1650,12 +1650,20 @@ def api_memory_top():
         q = request.args.get("q") or request.args.get("query") or ""
         k = int(request.args.get("k", 5))
         boost = request.args.get("boost", "").split(",") if request.args.get("boost") else None
+        workspace_id = request.args.get("workspace_id")
+        owner_id = request.args.get("owner_id")
+        agent_id = request.args.get("agent_id")
+        session_id = request.args.get("session_id")
         use_graph = request.args.get("graph", "true").strip().lower() not in {"0", "false", "no", "off"}
         max_hops = max(0, min(int(request.args.get("hops", 2)), 4))
         rows = marven.memmgr.search_evidence(
             q,
             top_k=max(1, min(k, 20)),
             boost_tags=boost,
+            workspace_id=workspace_id,
+            owner_id=owner_id,
+            agent_id=agent_id,
+            session_id=session_id,
             use_graph=use_graph,
             max_hops=max_hops,
             as_of=request.args.get("as_of"),
@@ -1667,6 +1675,10 @@ def api_memory_top():
         out = [
             {
                 "id": row["id"],
+                "workspaceId": row["workspace_id"],
+                "ownerId": row["owner_id"],
+                "agentId": row["agent_id"],
+                "sessionId": row["session_id"],
                 "text": row["text"],
                 "tags": row["tags"],
                 "subject": row["subject"],
@@ -1676,16 +1688,34 @@ def api_memory_top():
                 "validTo": row["valid_to"],
                 "trustStatus": row["trust_status"],
                 "score": float(row["score"]),
+                "semanticScore": float(row["semantic_score"]),
+                "semanticRank": row["semantic_rank"],
+                "lexicalScore": float(row["lexical_score"]),
+                "lexicalRank": row["lexical_rank"],
+                "lexicalBm25": row["lexical_bm25"],
+                "fusionScore": float(row["fusion_score"]),
+                "tagBoost": float(row["tag_boost"]),
                 "baseScore": float(row["base_score"]),
                 "graphScore": float(row["graph_score"]),
                 "graphPath": row["graph_path"],
+                "retrieval": row["retrieval"],
             }
             for row in rows
         ]
         return jsonify(
             {
                 "query": q,
-                "retrieval": {"graph": use_graph, "maxHops": max_hops},
+                "scope": {
+                    "workspaceId": workspace_id or marven.memmgr.default_scope.workspace_id,
+                    "ownerId": owner_id or marven.memmgr.default_scope.owner_id,
+                    "agentId": agent_id,
+                    "sessionId": session_id,
+                },
+                "retrieval": {
+                    "graph": use_graph,
+                    "maxHops": max_hops,
+                    "fusion": "rrf",
+                },
                 "top": out,
             }
         )
@@ -1702,6 +1732,8 @@ def api_memory_graph():
         return jsonify(
             marven.memmgr.graph_snapshot(
                 memory_id=memory_id,
+                workspace_id=request.args.get("workspace_id"),
+                owner_id=request.args.get("owner_id"),
                 max_hops=max_hops,
                 limit=limit,
             )
@@ -1725,10 +1757,109 @@ def api_memory_graph_rebuild():
         )
 
 
+@app.get("/api/memory/proposals")
+def api_memory_proposals():
+    try:
+        requested_status = request.args.get("status", "pending").strip().lower()
+        status = None if requested_status in {"", "all"} else requested_status
+        proposals = marven.memmgr.list_memory_proposals(
+            status=status,
+            workspace_id=request.args.get("workspace_id"),
+            owner_id=request.args.get("owner_id"),
+            agent_id=request.args.get("agent_id"),
+            session_id=request.args.get("session_id"),
+            limit=request.args.get("limit", 100),
+        )
+        return jsonify({"proposals": proposals})
+    except ValueError:
+        return _json_failure("Invalid memory proposal query.", 400, "Proposal query failed")
+    except Exception:
+        return _json_failure("Unable to load memory proposals.", 500, "Proposal listing failed")
+
+
+@app.post("/api/memory/proposals")
+def api_memory_proposal_create():
+    try:
+        data = request.get_json() or {}
+        proposal_id = marven.memmgr.propose_memory(
+            data.get("text", ""),
+            tags=data.get("tags"),
+            workspace_id=data.get("workspace_id", data.get("workspaceId")),
+            owner_id=data.get("owner_id", data.get("ownerId")),
+            agent_id=data.get("agent_id", data.get("agentId")),
+            session_id=data.get("session_id", data.get("sessionId")),
+            subject=data.get("subject", ""),
+            memory_type=data.get("memory_type", data.get("memoryType", "episodic")),
+            source=data.get("source", "user"),
+            source_locator=data.get("source_locator", data.get("sourceLocator", "")),
+            valid_from=data.get("valid_from", data.get("validFrom")),
+            valid_to=data.get("valid_to", data.get("validTo")),
+            confidence=data.get("confidence", 1.0),
+            trust_status=data.get("trust_status", data.get("trustStatus", "unverified")),
+            consent_scope=data.get("consent_scope", data.get("consentScope", "local")),
+            visibility=data.get("visibility", "private"),
+            episode_id=data.get("episode_id", data.get("episodeId", "")),
+            lineage=data.get("lineage"),
+            supersedes=data.get("supersedes"),
+            metadata=data.get("metadata"),
+        )
+        return jsonify({"status": "pending", "proposalId": proposal_id}), 201
+    except (TypeError, ValueError):
+        return _json_failure("Invalid memory proposal.", 400, "Proposal creation failed")
+    except Exception:
+        return _json_failure("Unable to create memory proposal.", 500, "Proposal creation failed")
+
+
+@app.post("/api/memory/proposals/<proposal_id>/approve")
+def api_memory_proposal_approve(proposal_id):
+    try:
+        data = request.get_json() or {}
+        canonical_id = marven.memmgr.approve_memory_proposal(
+            proposal_id,
+            workspace_id=data.get("workspace_id", data.get("workspaceId")),
+            owner_id=data.get("owner_id", data.get("ownerId")),
+            decision_reason=data.get("reason", ""),
+        )
+        return jsonify(
+            {
+                "status": "approved",
+                "proposalId": proposal_id,
+                "memoryId": canonical_id,
+            }
+        )
+    except ValueError:
+        return _json_failure("Unable to approve memory proposal.", 409, "Proposal approval failed")
+    except Exception:
+        return _json_failure("Unable to approve memory proposal.", 500, "Proposal approval failed")
+
+
+@app.post("/api/memory/proposals/<proposal_id>/reject")
+def api_memory_proposal_reject(proposal_id):
+    try:
+        data = request.get_json() or {}
+        rejected = marven.memmgr.reject_memory_proposal(
+            proposal_id,
+            workspace_id=data.get("workspace_id", data.get("workspaceId")),
+            owner_id=data.get("owner_id", data.get("ownerId")),
+            decision_reason=data.get("reason", ""),
+        )
+        if not rejected:
+            return _json_failure("Unable to reject memory proposal.", 409, "Proposal rejection failed")
+        return jsonify({"status": "rejected", "proposalId": proposal_id})
+    except ValueError:
+        return _json_failure("Unable to reject memory proposal.", 400, "Proposal rejection failed")
+    except Exception:
+        return _json_failure("Unable to reject memory proposal.", 500, "Proposal rejection failed")
+
+
 @app.get("/api/memory/hot")
 def api_memory_hot():
     try:
-        items = marven.memmgr.list_hot(50)
+        items = marven.memmgr.list_hot(
+            50,
+            workspace_id=request.args.get("workspace_id"),
+            owner_id=request.args.get("owner_id"),
+        )
         return jsonify({"hot": items})
     except Exception:
         return _json_failure("Unable to load memory.", 500, "Hot memory listing failed")
