@@ -1706,8 +1706,8 @@ def api_memory_graph():
                 limit=limit,
             )
         )
-    except ValueError as exc:
-        return jsonify({"error": str(exc)}), 404
+    except ValueError:
+        return _json_failure("Unable to load the memory graph.", 404, "Invalid memory graph request")
     except Exception:
         return _json_failure("Unable to load the memory graph.", 500, "Memory graph failed")
 
