@@ -2,6 +2,8 @@ from __future__ import annotations
 import pathlib as pl
 from typing import Any, Dict, Optional, List
 
+from ..security import resolve_path_within
+
 try:
     import yaml  # type: ignore
 except Exception:
@@ -52,17 +54,28 @@ class Policy:
                     allow.append(s[2:])
                     data["capabilities"][current]["allow_paths"] = allow
             self.data = data
+    def resolve_path(self, cap: str, path: pl.Path) -> Optional[pl.Path]:
+        """Return an authorized, resolved path or ``None`` when access is denied."""
+        cfg = self.data.get("capabilities", {}).get(cap, {})
+        if not cfg or not cfg.get("enabled", False):
+            return None
+
+        supplied = pl.Path(path)
+        candidate = supplied.resolve() if supplied.is_absolute() else (self.root / supplied).resolve()
+        for allowed_path in cfg.get("allow_paths", []):
+            allowed_root = pl.Path(allowed_path)
+            if not allowed_root.is_absolute():
+                allowed_root = self.root / allowed_root
+            try:
+                return resolve_path_within(allowed_root, candidate)
+            except ValueError:
+                continue
+        return None
+
     def check(self, cap: str, path: Optional[pl.Path] = None) -> bool:
         cfg = self.data.get("capabilities", {}).get(cap, {})
         if not cfg or not cfg.get("enabled", False):
             return False
-        if path is not None:
-            allow = []
-            for allowed_path in cfg.get("allow_paths", []):
-                candidate = pl.Path(allowed_path)
-                if not candidate.is_absolute():
-                    candidate = self.root / candidate
-                allow.append(candidate.resolve())
-            rp = path.resolve()
-            return any(rp == allowed or allowed in rp.parents for allowed in allow) if allow else True
-        return True
+        if path is None:
+            return True
+        return self.resolve_path(cap, path) is not None

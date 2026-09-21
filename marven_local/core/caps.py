@@ -1,9 +1,9 @@
 from __future__ import annotations
 import pathlib as pl
-import urllib.request
 from typing import List
 from .audit import Audit
 from .policy import Policy
+from ..security import open_public_http_url
 
 class CapabilityError(Exception):
     pass
@@ -18,24 +18,21 @@ class CapabilityManager:
     def _log(self, action: str, ok: bool, **details):
         self.audit.write(self.actor, action, ok, details)
     def fs_list(self, path: str) -> List[str]:
-        p = pl.Path(path)
-        ok = self.policy.check("fs.read", path=p)
-        self._log("fs.list", ok, path=str(p))
-        if not ok:
+        p = self.policy.resolve_path("fs.read", pl.Path(path))
+        self._log("fs.list", p is not None, path=str(path))
+        if p is None:
             raise CapabilityError("fs.read not permitted")
         return [str(x) for x in p.iterdir()]
     def fs_read(self, path: str) -> str:
-        p = pl.Path(path)
-        ok = self.policy.check("fs.read", path=p)
-        self._log("fs.read", ok, path=str(p))
-        if not ok:
+        p = self.policy.resolve_path("fs.read", pl.Path(path))
+        self._log("fs.read", p is not None, path=str(path))
+        if p is None:
             raise CapabilityError("fs.read not permitted")
         return p.read_text(encoding="utf-8")
     def fs_write(self, path: str, content: str) -> str:
-        p = pl.Path(path)
-        ok = self.policy.check("fs.write", path=p)
-        self._log("fs.write", ok, path=str(p), size=len(content))
-        if not ok:
+        p = self.policy.resolve_path("fs.write", pl.Path(path))
+        self._log("fs.write", p is not None, path=str(path), size=len(content))
+        if p is None:
             raise CapabilityError("fs.write not permitted")
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
@@ -45,8 +42,8 @@ class CapabilityManager:
         self._log("net.http.get", ok, url=url)
         if not ok:
             raise CapabilityError("net.http disabled")
-        with urllib.request.urlopen(url, timeout=5) as r:
-            return r.read().decode("utf-8", errors="ignore")
+        with open_public_http_url(url, timeout=5) as response:
+            return response.read(1_000_001)[:1_000_000].decode("utf-8", errors="ignore")
     def register(self, name: str, func):
         self.plugins[name] = func
     def call(self, name: str, **kwargs):
