@@ -34,7 +34,8 @@ ShadowBox_Framework/
 audit/
 history/
 logs/
-memory/
+/memory/
+reports/
 updates/
 Zipped Folders/
 marven-memories.json
@@ -53,6 +54,7 @@ E-MIRROR_Framework.json
 MarvenChatPage.tsx
 marven-system.json
 marven_metamirror.py
+data/longmemeval*.json
 
 # Local-only experiments and patch files
 *.diff

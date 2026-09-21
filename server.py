@@ -1650,11 +1650,79 @@ def api_memory_top():
         q = request.args.get("q") or request.args.get("query") or ""
         k = int(request.args.get("k", 5))
         boost = request.args.get("boost", "").split(",") if request.args.get("boost") else None
-        rows = marven.memmgr.search(q, top_k=max(1, min(k, 20)), boost_tags=boost)
-        out = [{"id": mid, "text": text, "tags": tags, "score": float(score)} for (mid, text, tags, score) in rows]
-        return jsonify({"query": q, "top": out})
+        use_graph = request.args.get("graph", "true").strip().lower() not in {"0", "false", "no", "off"}
+        max_hops = max(0, min(int(request.args.get("hops", 2)), 4))
+        rows = marven.memmgr.search_evidence(
+            q,
+            top_k=max(1, min(k, 20)),
+            boost_tags=boost,
+            use_graph=use_graph,
+            max_hops=max_hops,
+            as_of=request.args.get("as_of"),
+            time_start=request.args.get("time_start"),
+            time_end=request.args.get("time_end"),
+            consent_scope=request.args.get("consent_scope"),
+            visibility=request.args.get("visibility"),
+        )
+        out = [
+            {
+                "id": row["id"],
+                "text": row["text"],
+                "tags": row["tags"],
+                "subject": row["subject"],
+                "memoryType": row["memory_type"],
+                "createdAt": row["created_at"],
+                "validFrom": row["valid_from"],
+                "validTo": row["valid_to"],
+                "trustStatus": row["trust_status"],
+                "score": float(row["score"]),
+                "baseScore": float(row["base_score"]),
+                "graphScore": float(row["graph_score"]),
+                "graphPath": row["graph_path"],
+            }
+            for row in rows
+        ]
+        return jsonify(
+            {
+                "query": q,
+                "retrieval": {"graph": use_graph, "maxHops": max_hops},
+                "top": out,
+            }
+        )
     except Exception:
         return _json_failure("Unable to search memory.", 500, "Memory search failed")
+
+
+@app.get("/api/memory/graph")
+def api_memory_graph():
+    try:
+        memory_id = request.args.get("memory_id") or None
+        max_hops = max(0, min(int(request.args.get("hops", 2)), 4))
+        limit = max(1, min(int(request.args.get("limit", 200)), 1000))
+        return jsonify(
+            marven.memmgr.graph_snapshot(
+                memory_id=memory_id,
+                max_hops=max_hops,
+                limit=limit,
+            )
+        )
+    except ValueError:
+        return _json_failure("Unable to load the memory graph.", 404, "Invalid memory graph request")
+    except Exception:
+        return _json_failure("Unable to load the memory graph.", 500, "Memory graph failed")
+
+
+@app.post("/api/memory/graph/rebuild")
+def api_memory_graph_rebuild():
+    try:
+        status = marven.memmgr.rebuild_graph_projection()
+        return jsonify({"status": "ok", "projection": status})
+    except Exception:
+        return _json_failure(
+            "Unable to rebuild the memory graph.",
+            500,
+            "Memory graph rebuild failed",
+        )
 
 
 @app.get("/api/memory/hot")

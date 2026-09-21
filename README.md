@@ -48,7 +48,7 @@ Marven's target memory pipeline is:
 6. Retrieve candidates, then apply validity, contradiction, supersession, visibility, and policy checks.
 7. Give the model only eligible evidence, with enough metadata to cite it or state that the answer is unknown.
 
-A canonical record is expected to carry fields such as a stable memory ID, subject, content, type, source, source locator, creation time, validity interval, confidence, trust status, consent scope, visibility, episode group, lineage, supersession links, and deletion state. The exact schema is still under development.
+The first canonical schema is now implemented in SQLite. Records carry a stable memory ID, subject, content, type, source, source locator, creation time, validity interval, confidence, trust status, consent scope, visibility, episode group, lineage, supersession links, metadata, and deletion state. Legacy memory databases are migrated in place with conservative defaults.
 
 ### Two-stage retrieval
 
@@ -61,9 +61,9 @@ Reranking improves relevance. It does **not** prove that a memory is true, decid
 
 ### Evidence graph and Brain Tour
 
-The planned memory graph is an interpretable projection over canonical memory records. It can connect episodes, entities, claims, sources, and supersession relationships while keeping traversal typed, bounded, and auditable. The graph may propose related evidence; it does not silently rewrite canonical memory.
+The implemented evidence graph is an interpretable SQLite projection over canonical memory records. It connects subjects, tags, episodes, entities, sources, lineage, and supersession relationships while keeping traversal typed, bounded, and auditable. Retrieval returns its score components and best graph path. The graph may propose related evidence; it cannot silently rewrite canonical memory.
 
-The Brain Tour is a visualization and navigation layer over approved memory IDs and episode groups. It should be regenerable from the canonical store rather than become a second, competing memory database. A graph neural network is not assumed; deterministic graph traversal should prove useful first.
+The Brain Tour can use the bounded graph API as a visualization and navigation layer over approved memory IDs and episode groups. The projection is regenerable from the canonical store rather than becoming a second, competing memory database. A graph neural network is not assumed; deterministic traversal must prove useful first. See [Canonical Memory and Evidence Graph](docs/MEMORY_GRAPH.md).
 
 ## What is implemented in this repository
 
@@ -73,7 +73,7 @@ The Brain Tour is a visualization and navigation layer over approved memory IDs 
 | Local API | Flask endpoints for chat, streaming, health, file analysis, vision experiments, memory inspection, and local capabilities | Working prototype; interfaces may change |
 | Web client | React chat UI with model selection, file, policy, proposal, and Brain Tour controls | Working prototype |
 | Model backends | Ollama through LangChain plus an OpenAI-compatible local vLLM adapter | Experimental local inference |
-| Memory | File-backed chat history, SQLite persistent memory, lightweight retrieval, MetaMirror/reflection experiments, and local archives | Prototype; not yet the full canonical schema |
+| Memory | Canonical SQLite records, rebuildable vector and evidence-graph projections, governed graph-aware retrieval, MetaMirror/reflection experiments, and local archives | Working prototype; admission and evaluation remain experimental |
 | Capability controls | Policy-checked file/network/device capabilities, audit records, and signed self-update proposals | Experimental; not a complete sandbox |
 | Voice | Optional Vosk or Faster-Whisper ASR with interruptible local TTS | Separate prototype |
 | Personalization | Ollama model helpers and a LoRA training script | Research tooling |
@@ -85,6 +85,9 @@ Legacy prompts, manifests, and experimental directives in the repository do not 
 
 - `marven.py` — response flow, local model routing, file-backed sessions, SQLite memory, retrieval, web commands, and reflection experiments.
 - `server.py` — Flask API, streaming responses, vLLM integration, local capability endpoints, memory inspection, file analysis, and vision experiments.
+- `marven_local/memory/` — canonical memory schema, migration, projection rebuilding, graph traversal, temporal gates, and explainable retrieval.
+- `scripts/evaluate_longmemeval_retrieval.py` — local flat-versus-graph retrieval evaluation on LongMemEval data.
+- `docs/MEMORY_GRAPH.md` — memory schema, graph model, API, benchmark mapping, and GNN adoption gate.
 - `marven_local/` — capability policy, audit logging, plugins, learner experiments, and approval-based self-update workflow.
 - `marven-react-app/` — local React chat interface.
 - `marven-voice-interrupt-prototype_cpu_tuned/` — optional local ASR/TTS voice prototype.
@@ -183,10 +186,11 @@ The present code is an experimental prototype. Review it before enabling file ac
 
 ## Research roadmap
 
-- Replace lightweight memory records with the canonical schema and admission pipeline.
-- Add provenance, consent, validity intervals, trust states, supersession, and deletion propagation.
-- Evaluate hybrid retrieval and optional late-interaction reranking against realistic memory queries and hard negatives.
-- Generate the evidence graph and Brain Tour from canonical IDs instead of maintaining separate truth stores.
+- Harden the memory-admission workflow so provenance, consent, sensitivity, and trust decisions are explicit before storage.
+- Evaluate flat and graph-expanded retrieval on LongMemEval and Marven-specific update, temporal, privacy, and abstention cases.
+- Add hybrid lexical/dense retrieval and optional late-interaction reranking against realistic queries and hard negatives.
+- Build the Brain Tour visualization from the bounded graph API and canonical IDs.
+- Consider a GNN only after deterministic baselines and labeled data show which node, edge, or path predictions are useful.
 - Add evaluation for retrieval quality, contradiction handling, stale-memory rejection, privacy leakage, and abstention.
 - Unify the local prototype with Marven's mobile, voice, and persistent-presence experiences behind the orchestrator.
 - Keep self-improvement and personalization proposal-based, reviewable, and reversible.
