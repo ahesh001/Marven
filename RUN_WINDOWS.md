@@ -172,3 +172,40 @@ Under the hood this calls `C:\Marven\marven_cli.py` in the 3.11 venv.
   - `remember_mm: <text>` stores in the MetaMirror memory layer and indexes for retrieval.
 - Command Bar: in the React chat, use the small dropdown next to Attach to insert/run quick commands like `remember:`, `remember_mm:`, `web:search`, and file helpers.
 - MetaMirror Core Archive: the architecture is encoded in `memory/core_archive/MetaMirror_Core_Archive.md` and indexed into memory at startup.
+
+## 11) Collect Retrieval Labels
+
+Retrieval capture is off by default. Run the local reviewer when you deliberately
+want to retain queries and relevance judgments for evaluation:
+
+```powershell
+cd C:\Marven
+C:\Marven\.venv311\Scripts\python.exe scripts\label_memory_retrieval.py `
+  --workspace local `
+  --owner primary
+```
+
+Each returned memory can be graded `0` (irrelevant), `1` (marginal), `2`
+(relevant), or `3` (essential). The reviewer also accepts relevant canonical IDs
+that the current top-k missed. Export reviewed plaintext-query runs to the
+Git-ignored `reports` directory:
+
+```powershell
+C:\Marven\.venv311\Scripts\python.exe scripts\export_retrieval_labels.py `
+  reports\retrieval-labels.json `
+  --workspace local `
+  --owner primary
+```
+
+Queries, canonical IDs, labels, and reports can be sensitive. Do not commit the
+database or exports. See `docs\HYBRID_MEMORY_RETRIEVAL.md` for capture and
+deletion behavior.
+
+## 12) Optional Graphiti Evaluation
+
+Graphiti is isolated research tooling, not a Marven runtime dependency or a
+GNN. It requires a separate Python 3.10+ environment, a disposable graph
+database, and a structured-output model endpoint. Follow
+`experiments\graphiti\README.md` only after collecting a sufficiently reviewed
+label set. The evaluator defaults to loopback services, disables Graphiti
+telemetry and raw episode storage, and never writes to canonical Marven memory.

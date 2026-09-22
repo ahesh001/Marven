@@ -51,6 +51,9 @@ DEFAULT_GRAPH_EDGE_TYPES = frozenset(
 TRUST_STATES = frozenset({"confirmed", "unverified", "disputed", "rejected"})
 VISIBILITY_STATES = frozenset({"private", "shared", "public"})
 PROPOSAL_STATES = frozenset({"pending", "approved", "rejected"})
+RETRIEVAL_QUERY_STORAGE_MODES = frozenset({"plaintext", "hash-only"})
+RETRIEVAL_LABEL_SOURCES = frozenset({"human", "benchmark", "researcher"})
+RETRIEVAL_RELEVANCE_GRADES = frozenset({0, 1, 2, 3})
 
 
 def _utc_now() -> str:
@@ -269,6 +272,36 @@ class MemoryManager:
               decision_reason TEXT DEFAULT '',
               canonical_id TEXT DEFAULT ''
             );
+
+            CREATE TABLE IF NOT EXISTS retrieval_runs (
+              id TEXT PRIMARY KEY,
+              workspace_id TEXT NOT NULL,
+              owner_id TEXT NOT NULL,
+              agent_id TEXT NOT NULL DEFAULT '',
+              session_id TEXT NOT NULL DEFAULT '',
+              query_text TEXT NOT NULL DEFAULT '',
+              query_hash TEXT NOT NULL,
+              query_storage TEXT NOT NULL DEFAULT 'hash-only',
+              created_at TEXT NOT NULL,
+              top_k INTEGER NOT NULL,
+              result_ids TEXT NOT NULL DEFAULT '[]',
+              result_snapshot TEXT NOT NULL DEFAULT '[]',
+              retrieval_config TEXT NOT NULL DEFAULT '{}'
+            );
+
+            CREATE TABLE IF NOT EXISTS retrieval_labels (
+              id TEXT PRIMARY KEY,
+              run_id TEXT NOT NULL,
+              memory_id TEXT NOT NULL,
+              relevance INTEGER NOT NULL CHECK(relevance BETWEEN 0 AND 3),
+              label_source TEXT NOT NULL DEFAULT 'human',
+              labeler_id TEXT NOT NULL DEFAULT '',
+              note TEXT NOT NULL DEFAULT '',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL,
+              FOREIGN KEY(run_id) REFERENCES retrieval_runs(id) ON DELETE CASCADE,
+              UNIQUE(run_id, memory_id, label_source, labeler_id)
+            );
             """
         )
 
@@ -367,6 +400,10 @@ class MemoryManager:
             CREATE INDEX IF NOT EXISTS idx_graph_nodes_canonical ON memory_graph_nodes(canonical_id);
             CREATE INDEX IF NOT EXISTS idx_memory_proposal_scope
               ON memory_proposals(workspace_id, owner_id, status, proposed_at);
+            CREATE INDEX IF NOT EXISTS idx_retrieval_run_scope
+              ON retrieval_runs(workspace_id, owner_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_retrieval_label_run
+              ON retrieval_labels(run_id, relevance, memory_id);
             """
         )
         fts_schema = """
@@ -480,6 +517,44 @@ class MemoryManager:
             "decided_at": row["decided_at"],
             "decision_reason": row["decision_reason"] or "",
             "canonical_id": row["canonical_id"] or "",
+        }
+
+    def _row_to_retrieval_run(self, row: sqlite3.Row) -> Dict[str, Any]:
+        try:
+            snapshot_value = json.loads(row["result_snapshot"] or "[]")
+        except (TypeError, ValueError):
+            snapshot_value = []
+        snapshot = [
+            dict(item) for item in snapshot_value if isinstance(item, Mapping)
+        ] if isinstance(snapshot_value, list) else []
+        return {
+            "id": row["id"],
+            "workspace_id": row["workspace_id"],
+            "owner_id": row["owner_id"],
+            "agent_id": row["agent_id"] or "",
+            "session_id": row["session_id"] or "",
+            "query": row["query_text"] or "",
+            "query_hash": row["query_hash"],
+            "query_storage": row["query_storage"],
+            "created_at": row["created_at"],
+            "top_k": int(row["top_k"]),
+            "result_ids": _json_list(row["result_ids"]),
+            "results": snapshot,
+            "retrieval_config": _json_object(row["retrieval_config"]),
+        }
+
+    @staticmethod
+    def _row_to_retrieval_label(row: sqlite3.Row) -> Dict[str, Any]:
+        return {
+            "id": row["id"],
+            "run_id": row["run_id"],
+            "memory_id": row["memory_id"],
+            "relevance": int(row["relevance"]),
+            "label_source": row["label_source"],
+            "labeler_id": row["labeler_id"] or "",
+            "note": row["note"] or "",
+            "created_at": row["created_at"],
+            "updated_at": row["updated_at"],
         }
 
     def _index_text(self, record: Mapping[str, Any]) -> str:
@@ -1146,6 +1221,67 @@ class MemoryManager:
             raise ValueError("a superseding memory cannot change owner scope")
         return self.add_memory(text, **values)
 
+    def _scrub_retrieval_memory_reference(
+        self,
+        memory_id: str,
+        workspace_id: str,
+        owner_id: str,
+    ) -> None:
+        """Remove a deleted canonical ID from retained retrieval evidence."""
+
+        run_rows = self._conn.execute(
+            """
+            SELECT id, result_ids, result_snapshot
+            FROM retrieval_runs
+            WHERE workspace_id = ? AND owner_id = ?
+            """,
+            (workspace_id, owner_id),
+        ).fetchall()
+        for row in run_rows:
+            result_ids = _json_list(row["result_ids"])
+            try:
+                snapshot_value = json.loads(row["result_snapshot"] or "[]")
+            except (TypeError, ValueError):
+                snapshot_value = []
+            snapshot = snapshot_value if isinstance(snapshot_value, list) else []
+            if memory_id not in result_ids and not any(
+                isinstance(item, Mapping) and item.get("memory_id") == memory_id
+                for item in snapshot
+            ):
+                continue
+            kept_ids = [item for item in result_ids if item != memory_id]
+            kept_snapshot = [
+                item
+                for item in snapshot
+                if not isinstance(item, Mapping) or item.get("memory_id") != memory_id
+            ]
+            for rank, item in enumerate(kept_snapshot, start=1):
+                if isinstance(item, dict):
+                    item["rank"] = rank
+            self._conn.execute(
+                """
+                UPDATE retrieval_runs
+                SET result_ids = ?, result_snapshot = ?
+                WHERE id = ?
+                """,
+                (
+                    json.dumps(kept_ids),
+                    json.dumps(kept_snapshot, sort_keys=True),
+                    row["id"],
+                ),
+            )
+        self._conn.execute(
+            """
+            DELETE FROM retrieval_labels
+            WHERE memory_id = ?
+              AND run_id IN (
+                SELECT id FROM retrieval_runs
+                WHERE workspace_id = ? AND owner_id = ?
+              )
+            """,
+            (memory_id, workspace_id, owner_id),
+        )
+
     def delete_memory(
         self,
         memory_id: str,
@@ -1171,6 +1307,11 @@ class MemoryManager:
                 if self._fts_enabled:
                     self._conn.execute("DELETE FROM mem_fts WHERE id = ?", (memory_id,))
                 self._conn.execute("DELETE FROM hot WHERE id = ?", (memory_id,))
+                self._scrub_retrieval_memory_reference(
+                    memory_id,
+                    boundary[0],
+                    boundary[1],
+                )
         self.rebuild_graph_projection()
         return cursor.rowcount > 0
 
@@ -1214,6 +1355,42 @@ class MemoryManager:
         return [
             self._row_to_record(row)
             for row in self._conn.execute(query, tuple(params)).fetchall()
+        ]
+
+    def list_eligible_memories(
+        self,
+        *,
+        workspace_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        as_of: Optional[str] = None,
+        time_start: Optional[str] = None,
+        time_end: Optional[str] = None,
+        consent_scope: Optional[str] = None,
+        visibility: Optional[str] = None,
+        include_superseded: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Return governed canonical records for offline, scoped evaluation."""
+
+        records = self.list_memories(
+            workspace_id=workspace_id,
+            owner_id=owner_id,
+            agent_id=agent_id,
+            session_id=session_id,
+        )
+        return [
+            record
+            for record in records
+            if self._eligible(
+                record,
+                as_of=as_of,
+                time_start=time_start,
+                time_end=time_end,
+                consent_scope=consent_scope,
+                visibility=visibility,
+                include_superseded=include_superseded,
+            )
         ]
 
     def _all_memories(self, *, include_deleted: bool = False) -> List[Dict[str, Any]]:
@@ -1734,6 +1911,341 @@ class MemoryManager:
         return sorted(
             scored.values(), key=lambda item: (item["score"], item["created_at"]), reverse=True
         )[:top_k]
+
+    def record_retrieval_run(
+        self,
+        query: str,
+        results: Sequence[Mapping[str, Any]],
+        *,
+        workspace_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        agent_id: Optional[str] = None,
+        session_id: Optional[str] = None,
+        query_storage: str = "hash-only",
+        top_k: Optional[int] = None,
+        retrieval_config: Optional[Mapping[str, Any]] = None,
+    ) -> str:
+        """Persist a scoped, labelable retrieval event without copying memory text.
+
+        Query storage is explicit. ``hash-only`` supports audit and deletion while
+        avoiding raw-query retention; ``plaintext`` is required for a reusable
+        supervised evaluation dataset.
+        """
+
+        query_value = str(query or "")
+        if not query_value.strip():
+            raise ValueError("retrieval query must not be empty")
+        if len(query_value) > 8192:
+            raise ValueError("retrieval query must be at most 8192 characters")
+        storage_mode = str(query_storage or "").strip().lower()
+        if storage_mode not in RETRIEVAL_QUERY_STORAGE_MODES:
+            raise ValueError(f"invalid retrieval query storage mode: {query_storage}")
+
+        boundary = self._resolve_boundary(workspace_id, owner_id)
+        agent_filter = normalize_scope_id(agent_id, "agent_id", required=False)
+        session_filter = normalize_scope_id(session_id, "session_id", required=False)
+        config = dict(retrieval_config or {})
+        # Fail before writing rather than storing a partially serializable run.
+        config_json = json.dumps(config, sort_keys=True)
+        result_ids: List[str] = []
+        snapshot: List[Dict[str, Any]] = []
+        snapshot_fields = (
+            "score",
+            "semantic_score",
+            "semantic_rank",
+            "lexical_score",
+            "lexical_rank",
+            "lexical_bm25",
+            "fusion_score",
+            "tag_boost",
+            "base_score",
+            "graph_score",
+            "graph_path",
+        )
+        for result in results:
+            memory_id = str(result.get("id") or "").strip()
+            if not memory_id or memory_id in result_ids:
+                continue
+            memory = self.get_memory(
+                memory_id,
+                workspace_id=boundary[0],
+                owner_id=boundary[1],
+            )
+            if memory is None:
+                raise ValueError("retrieval results must remain inside one owner scope")
+            if agent_filter and memory["agent_id"] != agent_filter:
+                raise ValueError("retrieval results must remain inside the captured agent scope")
+            if session_filter and memory["session_id"] != session_filter:
+                raise ValueError("retrieval results must remain inside the captured session scope")
+            if not self._eligible(
+                memory,
+                as_of=config.get("as_of"),
+                time_start=config.get("time_start"),
+                time_end=config.get("time_end"),
+                consent_scope=config.get("consent_scope"),
+                visibility=config.get("visibility"),
+                include_superseded=bool(config.get("include_superseded", False)),
+            ):
+                raise ValueError("retrieval results must be eligible in the captured policy scope")
+            result_ids.append(memory_id)
+            item: Dict[str, Any] = {"memory_id": memory_id, "rank": len(result_ids)}
+            for field in snapshot_fields:
+                if field in result:
+                    item[field] = result[field]
+            snapshot.append(item)
+
+        requested_top_k = len(result_ids) if top_k is None else int(top_k)
+        requested_top_k = max(1, min(requested_top_k, 1000))
+        run_id = f"retrieval_{uuid.uuid4().hex[:12]}"
+        timestamp = _utc_now()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO retrieval_runs(
+                  id, workspace_id, owner_id, agent_id, session_id,
+                  query_text, query_hash, query_storage, created_at, top_k,
+                  result_ids, result_snapshot, retrieval_config
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)
+                """,
+                (
+                    run_id,
+                    boundary[0],
+                    boundary[1],
+                    agent_filter,
+                    session_filter,
+                    query_value if storage_mode == "plaintext" else "",
+                    hashlib.sha256(query_value.encode("utf-8")).hexdigest(),
+                    storage_mode,
+                    timestamp,
+                    requested_top_k,
+                    json.dumps(result_ids),
+                    json.dumps(snapshot, sort_keys=True),
+                    config_json,
+                ),
+            )
+        return run_id
+
+    def get_retrieval_run(
+        self,
+        run_id: str,
+        *,
+        workspace_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        include_labels: bool = True,
+    ) -> Optional[Dict[str, Any]]:
+        boundary = self._resolve_boundary(workspace_id, owner_id)
+        row = self._conn.execute(
+            """
+            SELECT * FROM retrieval_runs
+            WHERE id = ? AND workspace_id = ? AND owner_id = ?
+            """,
+            (run_id, boundary[0], boundary[1]),
+        ).fetchone()
+        if row is None:
+            return None
+        run = self._row_to_retrieval_run(row)
+        if include_labels:
+            label_rows = self._conn.execute(
+                """
+                SELECT * FROM retrieval_labels
+                WHERE run_id = ?
+                ORDER BY updated_at ASC, id ASC
+                """,
+                (run_id,),
+            ).fetchall()
+            run["labels"] = [self._row_to_retrieval_label(item) for item in label_rows]
+        return run
+
+    def label_retrieval_result(
+        self,
+        run_id: str,
+        memory_id: str,
+        relevance: int,
+        *,
+        workspace_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        label_source: str = "human",
+        labeler_id: str = "",
+        note: str = "",
+    ) -> Dict[str, Any]:
+        """Create or correct a graded relevance judgment for one canonical ID."""
+
+        boundary = self._resolve_boundary(workspace_id, owner_id)
+        run = self.get_retrieval_run(
+            run_id,
+            workspace_id=boundary[0],
+            owner_id=boundary[1],
+            include_labels=False,
+        )
+        if run is None:
+            raise ValueError(f"unknown retrieval run: {run_id}")
+        try:
+            grade = int(relevance)
+            exact_grade = float(relevance) == grade
+        except (TypeError, ValueError):
+            raise ValueError("relevance must be an integer from 0 to 3") from None
+        if (
+            isinstance(relevance, bool)
+            or not exact_grade
+            or grade not in RETRIEVAL_RELEVANCE_GRADES
+        ):
+            raise ValueError("relevance must be an integer from 0 to 3")
+
+        memory_key = str(memory_id or "").strip()
+        memory = self.get_memory(
+            memory_key,
+            workspace_id=boundary[0],
+            owner_id=boundary[1],
+        )
+        if memory is None:
+            raise ValueError("retrieval labels must reference an active memory in the run scope")
+        if run["agent_id"] and memory["agent_id"] != run["agent_id"]:
+            raise ValueError("retrieval labels must remain inside the run's agent scope")
+        if run["session_id"] and memory["session_id"] != run["session_id"]:
+            raise ValueError("retrieval labels must remain inside the run's session scope")
+        config = run["retrieval_config"]
+        if not self._eligible(
+            memory,
+            as_of=config.get("as_of"),
+            time_start=config.get("time_start"),
+            time_end=config.get("time_end"),
+            consent_scope=config.get("consent_scope"),
+            visibility=config.get("visibility"),
+            include_superseded=bool(config.get("include_superseded", False)),
+        ):
+            raise ValueError("retrieval labels must reference memory eligible in the run scope")
+        if memory_key not in run["result_ids"] and grade < 2:
+            raise ValueError("an unreturned memory may only be labeled relevant or essential")
+
+        source = str(label_source or "").strip().lower()
+        if source not in RETRIEVAL_LABEL_SOURCES:
+            raise ValueError(f"invalid retrieval label source: {label_source}")
+        labeler = normalize_scope_id(labeler_id, "labeler_id", required=False)
+        note_value = str(note or "").strip()
+        if len(note_value) > 2000:
+            raise ValueError("retrieval label note must be at most 2000 characters")
+
+        label_id = f"label_{uuid.uuid4().hex[:12]}"
+        timestamp = _utc_now()
+        with self._conn:
+            self._conn.execute(
+                """
+                INSERT INTO retrieval_labels(
+                  id, run_id, memory_id, relevance, label_source, labeler_id,
+                  note, created_at, updated_at
+                ) VALUES (?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(run_id, memory_id, label_source, labeler_id)
+                DO UPDATE SET relevance = excluded.relevance,
+                              note = excluded.note,
+                              updated_at = excluded.updated_at
+                """,
+                (
+                    label_id,
+                    run_id,
+                    memory_key,
+                    grade,
+                    source,
+                    labeler,
+                    note_value,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        row = self._conn.execute(
+            """
+            SELECT * FROM retrieval_labels
+            WHERE run_id = ? AND memory_id = ? AND label_source = ? AND labeler_id = ?
+            """,
+            (run_id, memory_key, source, labeler),
+        ).fetchone()
+        return self._row_to_retrieval_label(row)
+
+    def list_retrieval_runs(
+        self,
+        *,
+        workspace_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        labeled_only: bool = False,
+        include_hash_only: bool = True,
+        limit: int = 1000,
+    ) -> List[Dict[str, Any]]:
+        boundary = self._resolve_boundary(workspace_id, owner_id)
+        conditions = ["workspace_id = ?", "owner_id = ?"]
+        params: List[Any] = [boundary[0], boundary[1]]
+        if labeled_only:
+            conditions.append(
+                "EXISTS (SELECT 1 FROM retrieval_labels "
+                "WHERE retrieval_labels.run_id = retrieval_runs.id)"
+            )
+        if not include_hash_only:
+            conditions.append("query_storage = 'plaintext'")
+        params.append(max(1, min(int(limit), 10000)))
+        rows = self._conn.execute(
+            f"""
+            SELECT * FROM retrieval_runs
+            WHERE {' AND '.join(conditions)}
+            ORDER BY created_at DESC, id DESC
+            LIMIT ?
+            """,
+            tuple(params),
+        ).fetchall()
+        runs: List[Dict[str, Any]] = []
+        for row in rows:
+            run = self._row_to_retrieval_run(row)
+            label_rows = self._conn.execute(
+                """
+                SELECT * FROM retrieval_labels
+                WHERE run_id = ?
+                ORDER BY updated_at ASC, id ASC
+                """,
+                (run["id"],),
+            ).fetchall()
+            run["labels"] = [self._row_to_retrieval_label(item) for item in label_rows]
+            runs.append(run)
+        return runs
+
+    def export_retrieval_labels(
+        self,
+        *,
+        workspace_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+        include_hash_only: bool = False,
+    ) -> Dict[str, Any]:
+        """Export only labeled runs; memory text remains in the canonical database."""
+
+        boundary = self._resolve_boundary(workspace_id, owner_id)
+        runs = self.list_retrieval_runs(
+            workspace_id=boundary[0],
+            owner_id=boundary[1],
+            labeled_only=True,
+            include_hash_only=include_hash_only,
+            limit=10000,
+        )
+        return {
+            "schema": "marven.retrieval-labels.v1",
+            "exported_at": _utc_now(),
+            "scope": {"workspace_id": boundary[0], "owner_id": boundary[1]},
+            "run_count": len(runs),
+            "runs": runs,
+        }
+
+    def delete_retrieval_run(
+        self,
+        run_id: str,
+        *,
+        workspace_id: Optional[str] = None,
+        owner_id: Optional[str] = None,
+    ) -> bool:
+        boundary = self._resolve_boundary(workspace_id, owner_id)
+        with self._conn:
+            cursor = self._conn.execute(
+                """
+                DELETE FROM retrieval_runs
+                WHERE id = ? AND workspace_id = ? AND owner_id = ?
+                """,
+                (run_id, boundary[0], boundary[1]),
+            )
+        return cursor.rowcount == 1
 
     def search(
         self,

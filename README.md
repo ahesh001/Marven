@@ -38,7 +38,7 @@ The orchestrator—not the selected model—remains responsible for deciding wha
 
 ## Memory and retrieval design
 
-Marven's target memory pipeline is:
+Marven's memory pipeline is:
 
 1. Preserve a raw episodic event with its source and access scope.
 2. Extract one or more candidate memories without automatically accepting them as fact.
@@ -50,12 +50,19 @@ Marven's target memory pipeline is:
 
 The first canonical schema is now implemented in SQLite. Records carry a stable memory ID, subject, content, type, source, source locator, creation time, validity interval, confidence, trust status, consent scope, visibility, episode group, lineage, supersession links, metadata, and deletion state. Legacy memory databases are migrated in place with conservative defaults.
 
-### Two-stage retrieval
+### Two-stage retrieval and evaluation
 
-Marven is moving toward a two-stage retrieval design:
+Marven now has a deterministic first-stage retrieval baseline and a measured
+path for deciding whether a second-stage system is worth its complexity:
 
-- **Candidate generation:** scoped embedding and SQLite FTS5 search over approved memories, with candidate union and reciprocal-rank fusion before graph expansion. The dependency-free hash embedder remains a fallback; a learned local sentence-transformer can be enabled without changing canonical records.
+- **Candidate generation:** scoped embedding and SQLite FTS5 search over approved memories, with candidate union and reciprocal-rank fusion before graph expansion. The dependency-free hash embedder remains the default; a learned local sentence-transformer can be enabled without changing canonical records.
 - **Optional late-interaction reranking:** token-level representations and MaxSim-style comparison can recover precise details that a single-vector search may miss. ColBERT-style reranking is an active research direction, not a production dependency in this repository.
+
+Opt-in retrieval runs can now be graded from `0` (irrelevant) through `3`
+(essential), corrected later, and exported without copying canonical memory text.
+Those judgments establish one evaluation set for the Marven baseline and an
+isolated Graphiti experiment. Graphiti is not part of Marven's runtime and is
+not a GNN. See [Graphiti Evaluation Decision](docs/GRAPHITI_EVALUATION.md).
 
 Reranking improves relevance. It does **not** prove that a memory is true, decide which belief is current, resolve contradictions, enforce consent, or propagate deletion. Those remain governance responsibilities after retrieval.
 
@@ -73,7 +80,7 @@ The Brain Tour can use the bounded graph API as a visualization and navigation l
 | Local API | Flask endpoints for chat, streaming, health, file analysis, vision experiments, memory inspection, and local capabilities | Working prototype; interfaces may change |
 | Web client | React chat UI with model selection, file, policy, proposal, and Brain Tour controls | Working prototype |
 | Model backends | Ollama through LangChain plus an OpenAI-compatible local vLLM adapter | Experimental local inference |
-| Memory | Owner-scoped canonical SQLite records, approval-gated proposals, rebuildable embedding/FTS5/evidence-graph projections, hybrid RRF retrieval, MetaMirror/reflection experiments, and local archives | Working prototype; extraction and evaluation remain experimental |
+| Memory | Owner-scoped canonical SQLite records, approval-gated proposals, rebuildable embedding/FTS5/evidence-graph projections, hybrid RRF retrieval, opt-in graded retrieval labels, MetaMirror/reflection experiments, and local archives | Working prototype; extraction and comparative evaluation remain experimental |
 | Capability controls | Policy-checked file/network/device capabilities, audit records, and signed self-update proposals | Experimental; not a complete sandbox |
 | Voice | Optional Vosk or Faster-Whisper ASR with interruptible local TTS | Separate prototype |
 | Personalization | Ollama model helpers and a LoRA training script | Research tooling |
@@ -87,14 +94,18 @@ Legacy prompts, manifests, and experimental directives in the repository do not 
 - `server.py` — Flask API, streaming responses, vLLM integration, local capability endpoints, memory inspection, file analysis, and vision experiments.
 - `marven_local/memory/` — canonical memory schema, migration, projection rebuilding, graph traversal, temporal gates, and explainable retrieval.
 - `scripts/evaluate_longmemeval_retrieval.py` — local flat-versus-graph retrieval evaluation on LongMemEval data.
+- `scripts/label_memory_retrieval.py` — interactive, owner-scoped graded relevance review.
+- `scripts/export_retrieval_labels.py` — privacy-aware label export for offline evaluation.
+- `experiments/graphiti/` — pinned, isolated Graphiti comparison harness with no canonical write-back.
 - `docs/MEMORY_GRAPH.md` — memory schema, graph model, API, benchmark mapping, and GNN adoption gate.
 - `docs/HYBRID_MEMORY_RETRIEVAL.md` — scope boundaries, embedding/FTS5 fusion, proposal admission, and score semantics.
+- `docs/GRAPHITI_EVALUATION.md` — Graphiti architecture boundary, evaluation protocol, risks, and decision gates.
 - `marven_local/` — capability policy, audit logging, plugins, learner experiments, and approval-based self-update workflow.
 - `marven-react-app/` — local React chat interface.
 - `marven-voice-interrupt-prototype_cpu_tuned/` — optional local ASR/TTS voice prototype.
 - `marven-training/` — optional LoRA training experiments.
 - `ollama/` — local Ollama model definitions and setup helpers.
-- `tests/` — tests for capability, policy, and self-update behavior.
+- `tests/` — tests for memory, retrieval evaluation, capability, policy, and self-update behavior.
 - `PRIVACY.md` — current privacy and data-handling expectations.
 - `RUN_WINDOWS.md` — detailed Windows setup and run commands.
 
@@ -191,7 +202,8 @@ The intended production boundary is deny-by-default and includes:
 - applying least-privilege permissions to tools and agents;
 - keeping service credentials outside clients and prompts;
 - requiring explicit consent before optional cloud processing;
-- propagating correction and deletion through indexes and graph projections; and
+- propagating correction and deletion through indexes, graph projections, and saved evaluation references;
+- treating retrieval queries, relevance labels, and experiment exports as sensitive local data; and
 - preferring an explicit “unknown” over invented memory or unsupported certainty.
 
 The present code is an experimental prototype. Review it before enabling file access, network access, microphones, cameras, self-update workflows, or sensitive data processing.
@@ -200,9 +212,11 @@ The present code is an experimental prototype. Review it before enabling file ac
 
 - Harden the memory-admission workflow so provenance, consent, sensitivity, and trust decisions are explicit before storage.
 - Evaluate flat and graph-expanded retrieval on LongMemEval and Marven-specific update, temporal, privacy, and abstention cases.
-- Evaluate the implemented embedding/FTS5/graph fusion against realistic queries and hard negatives, then add optional late-interaction reranking only if it improves the baseline.
+- Collect at least 50 reviewed retrieval queries with at least 80% judgment coverage, including hard negatives and relevant evidence missed by the baseline.
+- Run the isolated Graphiti comparison and retain the deterministic baseline unless Graphiti clears the documented quality, scope, provenance, deletion, privacy, latency, and cost gates.
+- Add optional late-interaction reranking only if it improves the same versioned label set.
 - Build the Brain Tour visualization from the bounded graph API and canonical IDs.
-- Consider a GNN only after deterministic baselines and labeled data show which node, edge, or path predictions are useful.
+- Consider a GNN only after deterministic and Graphiti-style baselines plus labeled data show which node, edge, or path predictions are useful.
 - Add evaluation for retrieval quality, contradiction handling, stale-memory rejection, privacy leakage, and abstention.
 - Unify the local prototype with Marven's mobile, voice, and persistent-presence experiences behind the orchestrator.
 - Keep self-improvement and personalization proposal-based, reviewable, and reversible.

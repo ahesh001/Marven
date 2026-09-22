@@ -1,6 +1,6 @@
 # Privacy Policy
 
-**Effective date: September 20, 2026**
+**Effective date: September 21, 2026**
 
 Marven is a local-first software project. This policy explains how the software and this source repository are intended to handle information. It is not a promise that every optional dependency or model service has identical practices; check those services' documentation before using them.
 
@@ -10,6 +10,8 @@ Depending on the features you enable, Marven may process:
 
 - prompts, responses, and conversation history;
 - locally stored memory, summaries, uploaded files, and application logs;
+- opt-in retrieval queries, query hashes, result IDs and score metadata,
+  graded relevance labels, and evaluation exports;
 - configuration values and local file paths needed to run the application;
 - audio captured by the optional voice prototype;
 - requests sent to a model server that you configure, such as Ollama or a compatible local endpoint.
@@ -18,9 +20,26 @@ Depending on the features you enable, Marven may process:
 
 The default design is local execution. The source repository does not include a hosted Marven telemetry service. However, information can leave your machine if you configure a remote model endpoint, web connector, cloud speech or text service, CDN, proxy, or other third-party integration. Those services have their own policies and terms.
 
+The optional Graphiti evaluation defaults to loopback model and graph endpoints,
+sets Graphiti telemetry off, and disables raw episode storage. It still sends
+approved canonical memory to the configured model and graph services and stores
+derived entities and facts. Remote endpoints require an explicit command-line
+override; review consent, provider terms, and retention before enabling one.
+
 ## Storage and deletion
 
-Runtime data may be written to local history, memory, cache, audio, or log paths created by the application or its dependencies. Inspect the active configuration and delete those files from your machine when they are no longer needed. The public repository excludes known runtime state and private development records; contributors must still inspect staged changes before publishing.
+Runtime data may be written to local history, memory, cache, audio, log,
+retrieval-label, report, or experimental graph-database paths created by the
+application or its dependencies. Retrieval query capture is off by default.
+Plaintext capture is required for reproducible supervised evaluation; hash-only
+capture can be selected when the query itself should not be retained. Deleting
+a captured run removes its labels, and deleting canonical memory removes that
+memory's saved label and result references. Destroy experimental graph data and
+exports separately when they are no longer authorized or needed.
+
+The public repository excludes known runtime state, reports, and private
+development records; contributors must still inspect staged changes before
+publishing.
 
 ## Sensitive information
 
