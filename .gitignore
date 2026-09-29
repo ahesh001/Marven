@@ -29,6 +29,14 @@ assets/
 *.mp4
 *.zip
 
+# Marven training outputs and private corpora
+marven-training/out/
+marven-training/private/
+marven-training/checkpoints/
+marven-training/*.jsonl
+*.safetensors
+*.gguf
+
 # Private runtime state, logs, conversations, and memory archives
 ShadowBox_Framework/
 audit/
@@ -49,7 +57,6 @@ marven_milestones.json
 server_err.log
 server_out.log
 *.egg-info/
-marven-training/*.jsonl
 E-MIRROR_Framework.json
 MarvenChatPage.tsx
 marven-system.json
